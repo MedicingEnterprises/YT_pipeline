@@ -19,6 +19,7 @@ import type {
   ActivityCategory,
   ActivityTone,
 } from '../models'
+import { addDays, workspaceToday } from './time.ts'
 
 // ============================================================================
 // TIMESTAMP UTILITIES
@@ -33,11 +34,8 @@ function dateOffset(days: number): string {
 }
 
 function dateTimeOffset(days: number, hour: number, minute: number): string {
-  const date = new Date(referenceTime)
-  date.setDate(date.getDate() + days)
-  date.setHours(hour, minute, 0, 0)
   const pad = (value: number) => String(value).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(hour)}:${pad(minute)}`
+  return `${addDays(workspaceToday('Asia/Colombo', new Date(referenceTime)), days)}T${pad(hour)}:${pad(minute)}`
 }
 
 // ============================================================================

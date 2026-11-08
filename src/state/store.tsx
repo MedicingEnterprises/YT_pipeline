@@ -1,7 +1,12 @@
-import { createContext, useContext, useRef, useState, type ReactNode } from 'react'
+import { Fragment, createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Channel, AIProvider, ContentItem, Pipeline, ScheduledVideo, Job, UserPreferences, AnalyticsVideo, Activity, PipelineStep, ContentStatus, ScheduleStatus, JobStatus } from '../models'
 import { executeOperation, collectionKeys, type Operation, type EntityKind, type EntityTypes, type SaveOperation } from './operations'
 import { validationError, type OperationResult } from './validation'
+import { createWorkspaceSession, createResetWorkspace, type PersistenceStatus, type WorkspaceSession } from './persistence.ts'
+import { executePipelineCommand, nextExecutionDelay, type ExecutionCommand, type SimulationOptions } from '../execution/engine.ts'
+import { createPipelineRunner } from '../execution/runner.ts'
+import { reconcileJobQueue, queueCommand, QUEUE_POLL_MS } from '../execution/queue.ts'
+import { advanceDurableQueue, createQueueDispatcher } from '../execution/dispatcher.ts'
 
 export interface AppState {
   // Entities
@@ -21,7 +26,7 @@ export interface AppState {
   selectedPipelineId: string | null
 }
 
-interface AppActions {
+interface LocalAppActions {
   // Channel operations
   addChannel: (channel: Channel) => OperationResult
   updateChannel: (id: string, updates: Partial<Channel>) => OperationResult
@@ -60,6 +65,14 @@ interface AppActions {
   updateJob: (id: string, updates: Partial<Job>) => OperationResult
   deleteJob: (id: string) => OperationResult
   updateJobStatus: (id: string, status: JobStatus) => OperationResult
+  startExecution: (contentId: string, options?: SimulationOptions) => OperationResult
+  pauseExecution: (jobId: string) => OperationResult
+  resumeExecution: (jobId: string) => OperationResult
+  cancelExecution: (jobId: string) => OperationResult
+  retryExecution: (jobId: string) => OperationResult
+  failExecution: (jobId: string) => OperationResult
+  cancelQueueJob: (jobId: string) => OperationResult
+  retryQueueJob: (jobId: string) => OperationResult
   
   // Preferences operations
   setPreferences: (preferences: UserPreferences) => OperationResult
@@ -81,29 +94,89 @@ interface AppActions {
   // Bulk operations
   initializeState: (state: Partial<AppState>) => OperationResult
   resetState: () => OperationResult
+  requestReset: () => void
+  cancelReset: () => void
+  retryPersistence: () => void
 }
 
 
-interface StoreContextValue {
+export type AppActions = { [K in keyof LocalAppActions]: LocalAppActions[K] extends (...args: infer A) => OperationResult ? (...args: A) => OperationResult | Promise<OperationResult> : LocalAppActions[K] }
+export interface StoreContextValue {
   state: AppState
   actions: AppActions
   notice: OperationResult | null
   pendingDelete: { kind: EntityKind; id: string; name: string } | null
+  persistenceStatus: PersistenceStatus | null
+  pendingReset: boolean
+  workspaceRevision: number
+  remote?: boolean
+  reload?: () => Promise<void>
+  saving?: boolean
+  syncError?: string
 }
-const StoreContext = createContext<StoreContextValue | null>(null)
+export const StoreContext = createContext<StoreContextValue | null>(null)
 const createInitialState = (): AppState => ({ channels: new Map(), providers: new Map(), content: new Map(), pipelines: new Map(), scheduledVideos: new Map(), jobs: new Map(), preferences: null, analytics: new Map(), activities: [], selectedChannelId: null, selectedContentId: null, selectedPipelineId: null })
 export function useStore(): StoreContextValue {
   const context = useContext(StoreContext)
   if (!context) throw new Error('useStore must be used within a StoreProvider')
   return context
 }
-export function StoreProvider({ children, initialState }: { children: ReactNode; initialState?: Partial<AppState> }) {
-  const [state, setState] = useState<AppState>(() => ({ ...createInitialState(), ...initialState }))
+export function StoreProvider({ children, initialState, persistence }: { children: ReactNode; initialState?: Partial<AppState>; persistence?: WorkspaceSession }) {
+  // Explicit initialState keeps isolated previews/tests in memory. The real app
+  // restores storage once, before rendering any entity editors.
+  const [session] = useState(() => persistence ?? (initialState ? null : createWorkspaceSession()))
+  const [state, setState] = useState<AppState>(() => session?.state ?? ({ ...createInitialState(), ...initialState }))
+  const [persistenceStatus, setPersistenceStatus] = useState<PersistenceStatus | null>(() => session?.status ?? null)
+  const [pendingReset, setPendingReset] = useState(false)
+  const resetRequested = useRef(false)
+  const [workspaceRevision, setWorkspaceRevision] = useState(0)
   const current = useRef(state)
   const [notice, setNotice] = useState<OperationResult | null>(null)
   const [pendingDelete, setPendingDelete] = useState<StoreContextValue['pendingDelete']>(null)
   const deletion = useRef<StoreContextValue['pendingDelete']>(null)
-  const commit = (next: AppState) => { current.current = next; setState(next) }
+  const runner = useRef<ReturnType<typeof createPipelineRunner> | null>(null)
+  const commit = useCallback((next: AppState, persist = true) => {
+    if (persist) next = reconcileJobQueue(next, Date.now())
+    current.current = next; setState(next)
+    if (session && persist) setPersistenceStatus(session.save(next))
+    runner.current?.wake()
+  }, [session])
+  useEffect(() => {
+    // First-run demo data is saved only after mount, never during render.
+    commit(current.current)
+  }, [commit])
+  useEffect(() => {
+    const dispatcher = createQueueDispatcher({
+      error: () => setNotice({ ok: false, kind: 'failure', message: 'Automatic mock jobs stopped after an unexpected error. Reload the workspace to continue from saved checkpoints.', errors: {} }),
+      lock: typeof navigator !== 'undefined' && navigator.locks ? work => navigator.locks.request('content-hub.mock-queue', { ifAvailable: true }, lock => { if (lock) work() }) : undefined,
+      settled: () => runner.current?.wake(),
+      run: () => {
+        const outcome = advanceDurableQueue(current.current, Date.now(), session)
+        if (outcome.status) setPersistenceStatus(outcome.status)
+        if (outcome.state !== current.current) commit(outcome.state, false)
+      },
+    })
+    const driver = createPipelineRunner({
+      getState: () => current.current,
+      now: Date.now,
+      schedule: (callback, delay) => window.setTimeout(callback, delay),
+      clear: handle => window.clearTimeout(handle as number),
+      delay: (snapshot, now) => dispatcher.busy || dispatcher.failed || session && session.status.kind !== 'saved' ? QUEUE_POLL_MS : Math.min(nextExecutionDelay(snapshot, now) ?? QUEUE_POLL_MS, QUEUE_POLL_MS),
+      tick: () => dispatcher.tick(),
+    })
+    runner.current = driver
+    driver.wake()
+    return () => { dispatcher.dispose(); driver.dispose(); runner.current = null }
+    // The driver reads refs rather than retaining render-time state or actions.
+  }, [commit, session])
+  const runExecution = (command: ExecutionCommand): OperationResult => {
+    const outcome = (command.type === 'cancel' || command.type === 'retry') && current.current.jobs.get(command.jobId)?.queue
+      ? queueCommand(current.current, command.jobId, command.type, Date.now())
+      : executePipelineCommand(current.current, command, Date.now())
+    if (outcome.result.ok) commit(outcome.state)
+    setNotice(outcome.result)
+    return outcome.result
+  }
   const run = (operation: Operation): OperationResult => {
     const outcome = executeOperation(current.current, operation)
     if (outcome.result.ok) commit(outcome.state)
@@ -119,7 +192,7 @@ export function StoreProvider({ children, initialState }: { children: ReactNode;
   const select = (key: 'selectedChannelId' | 'selectedContentId' | 'selectedPipelineId', id: string | null): OperationResult => {
     const map = key === 'selectedChannelId' ? current.current.channels : key === 'selectedContentId' ? current.current.content : current.current.pipelines
     if (id && !map.has(id)) { const result = validationError({ selection: 'Choose an available item.' }); setNotice(result); return result }
-    commit({ ...current.current, [key]: id }); return { ok: true, message: 'Selection updated.' }
+    commit({ ...current.current, [key]: id }, false); return { ok: true, message: 'Selection updated.' }
   }
   const toggle = (kind: 'provider' | 'pipeline', id: string) => {
     const item = current.current[collectionKeys[kind]].get(id)
@@ -127,7 +200,16 @@ export function StoreProvider({ children, initialState }: { children: ReactNode;
   }
   const remove = (kind: EntityKind, id: string) => run({ type: 'delete', kind, id })
   const raw = (change: (state: AppState) => AppState): OperationResult => { commit(change(current.current)); return { ok: true, message: 'Workspace updated.' } }
-  const actions: AppActions = {
+  const rejectJobEdit = (): OperationResult => {
+    const result = validationError({ execution: 'Use the pipeline execution controls to change this job.' })
+    setNotice(result); return result
+  }
+  const runQueueCommand = (jobId: string, action: 'cancel' | 'retry') => {
+    const outcome = queueCommand(current.current, jobId, action, Date.now())
+    if (outcome.result.ok) commit(outcome.state)
+    setNotice(outcome.result); return outcome.result
+  }
+  const actions: LocalAppActions = {
     addChannel: value => save('channel', value, 'create'), updateChannel: (id, updates) => update('channel', id, updates), deleteChannel: id => remove('channel', id), selectChannel: id => select('selectedChannelId', id),
     addProvider: value => save('provider', value, 'create'), updateProvider: (id, updates) => update('provider', id, updates), deleteProvider: id => remove('provider', id), toggleProvider: id => toggle('provider', id),
     addContent: value => save('content', value, 'create'), updateContent: (id, updates) => update('content', id, updates), deleteContent: id => remove('content', id), updateContentStatus: (id, status) => {
@@ -144,9 +226,25 @@ export function StoreProvider({ children, initialState }: { children: ReactNode;
       if (!current.current.preferences) { const result: OperationResult = { ok: false, kind: 'failure', message: 'Workspace preferences are unavailable. Reload the workspace and try again.', errors: {} }; setNotice(result); return result }
       return run({ type: 'preferences', value: { ...current.current.preferences, ...updates } })
     },
-    addJob: value => raw(prev => ({ ...prev, jobs: new Map(prev.jobs).set(value.id, value) })), updateJob: (id, updates) => raw(prev => { const item = prev.jobs.get(id); return item ? { ...prev, jobs: new Map(prev.jobs).set(id, { ...item, ...updates, id }) } : prev }), deleteJob: id => raw(prev => ({ ...prev, jobs: new Map(Array.from(prev.jobs).filter(([key]) => key !== id)) })), updateJobStatus: (id, status) => actions.updateJob(id, { status }),
+    startExecution: (contentId, options) => runExecution({ type: 'start', contentId, jobId: `job-${crypto.randomUUID()}`, options: { reviewBeforePublishing: true, ...options } }),
+    cancelQueueJob: jobId => runQueueCommand(jobId, 'cancel'), retryQueueJob: jobId => runQueueCommand(jobId, 'retry'),
+    pauseExecution: jobId => runExecution({ type: 'pause', jobId }), resumeExecution: jobId => runExecution({ type: 'resume', jobId }), cancelExecution: jobId => runExecution({ type: 'cancel', jobId }), retryExecution: jobId => runExecution({ type: 'retry', jobId }), failExecution: jobId => runExecution({ type: 'fail', jobId }),
+    addJob: value => value.execution || value.queue || current.current.jobs.has(value.id) ? rejectJobEdit() : raw(prev => ({ ...prev, jobs: new Map(prev.jobs).set(value.id, value) })), updateJob: (id, updates) => current.current.jobs.get(id)?.execution || current.current.jobs.get(id)?.queue || updates.execution || updates.queue ? rejectJobEdit() : raw(prev => { const item = prev.jobs.get(id); return item ? { ...prev, jobs: new Map(prev.jobs).set(id, { ...item, ...updates, id }) } : prev }), deleteJob: id => current.current.jobs.get(id)?.execution || current.current.jobs.get(id)?.queue ? rejectJobEdit() : raw(prev => ({ ...prev, jobs: new Map(Array.from(prev.jobs).filter(([key]) => key !== id)) })), updateJobStatus: (id, status) => actions.updateJob(id, { status }),
     addAnalytics: value => raw(prev => ({ ...prev, analytics: new Map(prev.analytics).set(value.id, value) })), updateAnalytics: (id, updates) => raw(prev => { const item = prev.analytics.get(id); return item ? { ...prev, analytics: new Map(prev.analytics).set(id, { ...item, ...updates, id }) } : prev }), deleteAnalytics: id => raw(prev => ({ ...prev, analytics: new Map(Array.from(prev.analytics).filter(([key]) => key !== id)) })),
-    addActivity: value => raw(prev => ({ ...prev, activities: [value, ...prev.activities] })), clearActivities: () => raw(prev => ({ ...prev, activities: [] })), initializeState: updates => raw(prev => ({ ...prev, ...updates })), resetState: () => raw(() => createInitialState()),
+    addActivity: value => raw(prev => ({ ...prev, activities: [value, ...prev.activities] })), clearActivities: () => raw(prev => ({ ...prev, activities: [] })), initializeState: updates => raw(prev => ({ ...prev, ...updates })),
+    requestReset: () => { resetRequested.current = true; setPendingReset(true) },
+    cancelReset: () => { resetRequested.current = false; setPendingReset(false) },
+    retryPersistence: () => { if (session) setPersistenceStatus(session.retry(current.current)) },
+    resetState: () => {
+      if (!resetRequested.current) return validationError({ confirmation: 'Confirm the workspace reset first.' })
+      const result = session?.reset()
+      if (result) setPersistenceStatus(result.status)
+      if (result && !result.state) return { ok: false, kind: 'failure', message: 'The reset could not be saved. Your current workspace and the previous saved data have been kept. Restore storage access and try again.', errors: {} }
+      commit(result?.state ?? createResetWorkspace(), false)
+      deletion.current = null; setPendingDelete(null); setNotice(null)
+      actions.cancelReset(); setWorkspaceRevision(value => value + 1)
+      return { ok: true, message: 'Workspace reset.' }
+    },
     requestDelete: (kind, id) => {
       const item = current.current[collectionKeys[kind]].get(id)
       if (!item) { remove(kind, id); return }
@@ -164,7 +262,7 @@ export function StoreProvider({ children, initialState }: { children: ReactNode;
     },
     dismissNotice: () => setNotice(null),
   }
-  return <StoreContext.Provider value={{ state, actions, notice, pendingDelete }}>{children}</StoreContext.Provider>
+  return <StoreContext.Provider value={{ state, actions, notice, pendingDelete, persistenceStatus, pendingReset, workspaceRevision }}><Fragment key={workspaceRevision}>{children}</Fragment></StoreContext.Provider>
 }
 
 export function useChannels() {

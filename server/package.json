@@ -1,0 +1,44 @@
+{
+  "name": "content-hub-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:api": "node --import tsx tests/api.acceptance.ts",
+    "test:auth": "node --import tsx tests/auth.acceptance.ts",
+    "test:integration": "node --import tsx tests/frontend-integration.acceptance.ts",
+    "test:client": "node --import tsx tests/frontend-client.acceptance.ts",
+    "test:browser:smoke": "node --import tsx tests/frontend-browser.smoke.ts",
+    "db:validate": "node --env-file-if-exists=.env node_modules/prisma/build/index.js validate",
+    "db:generate": "node --env-file-if-exists=.env node_modules/prisma/build/index.js generate",
+    "db:migrate": "node --env-file-if-exists=.env node_modules/prisma/build/index.js migrate deploy",
+    "db:migrate:dev": "node --env-file-if-exists=.env node_modules/prisma/build/index.js migrate dev",
+    "db:status": "node --env-file-if-exists=.env node_modules/prisma/build/index.js migrate status",
+    "db:seed": "node --env-file-if-exists=.env node_modules/prisma/build/index.js db seed"
+  },
+  "dependencies": {
+    "@fastify/cookie": "11.1.5",
+    "@fastify/cors": "11.4.1",
+    "@fastify/helmet": "13.2.0",
+    "@fastify/rate-limit": "11.2.2",
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "fastify": "5.12.8",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.4.3",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.5",
+    "prisma": "7.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "~5.9.3"
+  }
+}

@@ -39,11 +39,17 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react'
-import { useEffect, useState, type FormEvent } from 'react'
-import { Link } from 'react-router-dom'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { Avatar, Badge, Button, Card, EmptyState, PageHeading, SectionHeading, Select, StatCard } from './components/ui'
 import { useStore } from './state/store'
+import { useOptionalAuth } from './auth/AuthProvider'
 import { ChannelEditor, ContentEditor, ScheduleEditor } from './components/EntityEditors'
+import { PipelineExecutionPanel } from './components/PipelineExecution'
+import { JobQueuePanel } from './components/JobQueue'
+import { PipelineDetailsDialog } from './components/PipelineDetails'
+import { canScheduleContent, workspaceCounts } from './state/selectors'
+import { calendarDate, calendarKey, formatWallTime, workspaceToday } from './state/time'
 import { useChannelRows, useContentRows, usePipelineRows, useScheduledVideoRows, useDashboardData, useAnalyticsRows } from './state/adapters'
 import type { UserPreferences } from './models'
 import { FieldError, OperationFeedback, useDialog, useSubmission } from './components/feedback'
@@ -51,6 +57,7 @@ import { providerTypesForStep, validateProvider, validatePipeline, validationErr
 import {
   useProviderRows,
   useProviderCategories,
+  useModelsByCategory,
 } from './state/adapters'
 
 type CreateAction = { onCreate: () => void }
@@ -88,7 +95,7 @@ type Channel = {
   scheduledCount: number
   publishedCount: number
   pipeline: string
-  recentUploads: { title: string; status: string; date: string; tone: 'green' | 'blue' | 'amber' }[]
+  recentUploads: { id: string; title: string; status: string; date: string; tone: 'green' | 'blue' | 'amber' }[]
 }
 
 type ContentStatus = 'Idea' | 'Script' | 'Generating' | 'Editing' | 'Ready' | 'Scheduled' | 'Published' | 'Failed'
@@ -120,7 +127,6 @@ const contentStatusTone: Record<ContentStatus, 'neutral' | 'blue' | 'violet' | '
   Failed: 'red',
 }
 
-const contentReferenceTime = Date.now()
 
 const providerCategories: ProviderCategory[] = [
   'Text generation',
@@ -130,13 +136,6 @@ const providerCategories: ProviderCategory[] = [
   'Embeddings / analysis',
 ]
 
-const modelsByCategory: Record<ProviderCategory, string[]> = {
-  'Text generation': ['GPT-4o', 'Claude 3.7 Sonnet', 'Gemini 2.5 Pro'],
-  'Text-to-speech': ['Eleven Multilingual v2', 'PlayHT 2.0', 'OpenAI TTS'],
-  'Image generation': ['Imagen 3', 'Stable Diffusion XL', 'DALL·E 3'],
-  'Video generation': ['Runway Gen-3', 'Veo 2', 'Kling 2.1'],
-  'Embeddings / analysis': ['text-embedding-3-large', 'Voyage 3', 'Gemini Embedding'],
-}
 
 type PipelineStepKind = 'Idea' | 'Script' | 'Voice' | 'Visuals' | 'Edit' | 'Captions' | 'Thumbnail' | 'Quality check' | 'Upload' | 'Schedule' | 'Research' | 'Review'
 
@@ -190,7 +189,7 @@ type ScheduledVideo = {
 
 function localDateTime(date: Date, hour: number, minute: number): string {
   const pad = (value: number) => String(value).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(hour)}:${pad(minute)}`
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(hour)}:${pad(minute)}`
 }
 
 function localDateKey(date: Date): string {
@@ -212,11 +211,17 @@ function VideoThumbnail({ kind, compact = false }: { kind: string; compact?: boo
 }
 
 function DashboardPage({ onCreate }: CreateAction) {
+  const [activityParams, setActivityParams] = useSearchParams()
+  const showActivityHistory = activityParams.get('activity') === 'all'
+  const setShowActivityHistory = (update: (value: boolean) => boolean) => setActivityParams(previous => { const next = new URLSearchParams(previous); if (update(showActivityHistory)) next.set('activity', 'all'); else next.delete('activity'); return next }, { replace: true })
+  useEffect(() => { if (showActivityHistory) document.getElementById('activity-history')?.scrollIntoView({ block: 'start' }) }, [showActivityHistory])
+  const timezone = useStore().state.preferences?.timezone ?? 'UTC'
   const channelRows = useChannelRows()
   const data = useDashboardData()
   const icons = [Video, CalendarDays, Activity, CheckCircle2]
   const tones = ['violet', 'blue', 'amber', 'green'] as const
   const dashboardMockData = { ...data, overview: data.overview.map((item, index) => ({ ...item, icon: icons[index], tone: tones[index] })), recentActivity: data.recentActivity.map(item => ({ ...item, icon: Activity })) }
+  const visibleActivity = (showActivityHistory ? data.activityHistory : data.recentActivity).map(item => ({ ...item, icon: Activity }))
 
   const processingCount = dashboardMockData.pipelineStages.reduce((sum, stage) => sum + stage.jobs, 0)
 
@@ -245,9 +250,9 @@ function DashboardPage({ onCreate }: CreateAction) {
                   <article className="upload-row" key={upload.title}>
                     <VideoThumbnail kind={upload.thumbnail} compact />
                     <div className="upload-copy">
-                      <h3>{upload.title}</h3>
+                      <h3><Link to={`/content?content=${encodeURIComponent(upload.contentId)}`}>{upload.title}</Link></h3>
                       <span>{upload.channel}</span>
-                      <time><CalendarDays size={12} />{formatContentDate(upload.scheduledAt)}</time>
+                      <time><CalendarDays size={12} />{formatContentDate(upload.scheduledAt, timezone)}</time>
                     </div>
                     <Badge tone={upload.tone} dot>{upload.status}</Badge>
                   </article>
@@ -267,7 +272,7 @@ function DashboardPage({ onCreate }: CreateAction) {
                   {dashboardMockData.pipelineStages.map((stage) => (
                     <div className="pipeline-stage-row" key={stage.name}>
                       <span className="pipeline-stage-name">{stage.name}</span>
-                      <div className="stage-track" aria-label={`${stage.jobs} jobs in ${stage.name}`}><span className={`stage-fill stage-fill-${stage.color}`} style={{ width: `${processingCount ? (stage.jobs / processingCount) * 100 : 0}%` }} /></div>
+                      <div className="stage-track" aria-label={`${stage.jobs} content items in ${stage.name}`}><span className={`stage-fill stage-fill-${stage.color}`} style={{ width: `${processingCount ? (stage.jobs / processingCount) * 100 : 0}%` }} /></div>
                       <strong>{stage.jobs}</strong>
                     </div>
                   ))}
@@ -281,15 +286,15 @@ function DashboardPage({ onCreate }: CreateAction) {
         </div>
 
         <div className="system-dashboard-secondary">
-          <Card className="system-panel activity-panel">
-            <SectionHeading title="Recent activity" action={<Badge tone="neutral">Mock activity</Badge>} />
-            {dashboardMockData.recentActivity.length > 0 ? (
+          <Card className="system-panel activity-panel" id="activity-history">
+            <SectionHeading title={showActivityHistory ? 'Activity history' : 'Recent activity'} action={<Button variant="quiet" onClick={() => setShowActivityHistory(value => !value)}>{showActivityHistory ? 'Show recent activity' : 'View activity history'}</Button>} />
+            {visibleActivity.length > 0 ? (
               <div className="system-activity-list">
-                {dashboardMockData.recentActivity.map(({ id, category, title, detail, time, icon: Icon, tone }) => (
+                {visibleActivity.map(({ id, category, title, detail, time, icon: Icon, tone, relatedContentId }) => (
                   <article className="system-activity-row" key={id}>
                     <span className={`activity-icon ${tone}`}><Icon size={15} /></span>
                     <div className="system-activity-copy">
-                      <div><strong>{title}</strong><Badge tone={tone === 'activity-red' ? 'red' : tone === 'activity-amber' ? 'amber' : tone === 'activity-green' ? 'green' : tone === 'activity-blue' ? 'blue' : 'violet'}>{category}</Badge></div>
+                      <div><strong>{relatedContentId ? <Link to={`/content?content=${encodeURIComponent(relatedContentId)}`}>{title}</Link> : title}</strong><Badge tone={tone === 'activity-red' ? 'red' : tone === 'activity-amber' ? 'amber' : tone === 'activity-green' ? 'green' : tone === 'activity-blue' ? 'blue' : 'violet'}>{category}</Badge></div>
                       <p>{detail}</p>
                       <time>{time}</time>
                     </div>
@@ -322,22 +327,17 @@ function DashboardPage({ onCreate }: CreateAction) {
           </Card>
         </div>
       </div>
+      <JobQueuePanel compact />
     </>
   )
 }
 
 function ChannelDetailsDialog({ channel, onClose, onConnect }: { channel: Channel; onClose: () => void; onConnect: () => void }) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose])
+  const ref = useDialog(onClose, false)
 
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <section className="dialog channel-details-dialog" role="dialog" aria-modal="true" aria-labelledby="channel-dialog-title">
+      <section ref={ref} tabIndex={-1} className="dialog channel-details-dialog" role="dialog" aria-modal="true" aria-labelledby="channel-dialog-title">
         <div className="dialog-header">
           <div className={`channel-details-avatar ${channel.color}`}>{channel.initials}</div>
           <Button variant="ghost" iconOnly icon={<X size={18} />} aria-label="Close channel details" onClick={onClose} />
@@ -368,19 +368,19 @@ function ChannelDetailsDialog({ channel, onClose, onConnect }: { channel: Channe
           <div className="channel-detail-pair"><span>Assigned pipeline</span><strong>{channel.pipeline}</strong></div>
         </section>
         <section className="channel-detail-section channel-recent-uploads">
-          <div className="channel-detail-section-title"><Video size={15} /><h3>Recent uploads</h3></div>
+          <div className="channel-detail-section-title"><Video size={15} /><h3>Associated content</h3></div>
           {channel.recentUploads.length > 0 ? channel.recentUploads.map((upload) => (
             <div className="channel-upload-row" key={upload.title}>
               <span className="channel-upload-icon"><Video size={14} /></span>
-              <span className="channel-upload-title"><strong>{upload.title}</strong><small>{upload.date}</small></span>
+              <span className="channel-upload-title"><Link to={`/content?content=${encodeURIComponent(upload.id)}`}>{upload.title}</Link><small>{upload.date}</small></span>
               <Badge tone={upload.tone} dot>{upload.status}</Badge>
             </div>
           )) : (
-            <EmptyState icon={<Video size={18} />} title="No uploads yet" description="Recent uploads will appear when this channel is connected." />
+            <EmptyState icon={<Video size={18} />} title="No content yet" description="Create an idea and assign it to this channel to begin." action={<Link to="/content">Open Content</Link>} />
           )}
         </section>
         <div className="dialog-footer">
-          {!channel.connected && <Button variant="primary" icon={<Plus size={15} />} onClick={onConnect}>Connect YouTube</Button>}
+          {!channel.connected && <Button variant="primary" icon={<Plus size={15} />} onClick={onConnect}>Mock-connect channel</Button>}
           <Button variant={channel.connected ? 'primary' : 'secondary'} onClick={onClose}>Done</Button>
         </div>
         <p className="dialog-note">Channel information is illustrative mock data. No YouTube connection is active.</p>
@@ -396,7 +396,8 @@ function ChannelsPage() {
   const onCreate = () => setEditingId(null)
 
   const [filter, setFilter] = useState('all')
-  const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null)
+  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null)
+  const selectedChannel = channelRows.find(channel => channel.id === selectedChannelId) ?? null
   const connectedChannels = channelRows.filter((channel) => channel.connected)
   const visibleChannels = channelRows.filter((channel) => (
     filter === 'all' || (filter === 'connected' ? channel.connected : !channel.connected)
@@ -450,7 +451,7 @@ function ChannelsPage() {
                 </div>
                 {Array.from(state.content.values()).some(item => item.channelId === channel.id) && <p className="disabled-action-note">Reassign or delete this channel’s content to enable deletion.</p>}
                 <div className="channel-card-actions">
-                  <Button variant="secondary" onClick={() => setSelectedChannel(channel)}>Channel details</Button>
+                  <Button variant="secondary" onClick={() => setSelectedChannelId(channel.id)}>Channel details</Button>
                   <Button variant="quiet" onClick={() => actions.updateChannel(channel.id, { status: channel.connected ? 'disconnected' : 'connected' })}>{channel.connected ? 'Disconnect' : 'Mock connect'}</Button>
                   <Button variant="quiet" disabled={Array.from(state.content.values()).some(item => item.channelId === channel.id)} title="Reassign or delete this channel’s content before deleting the channel" onClick={() => actions.requestDelete('channel', channel.id)}>Delete</Button>
                 </div>
@@ -466,11 +467,11 @@ function ChannelsPage() {
           />
         )}
       </div>
-      <Card className="channel-preview-note"><span className="notice-icon"><Lightbulb size={17} /></span><span><strong>Mock workspace</strong> Channel statuses, publishing preferences, and video totals are sample data. Connections and settings update this in-memory workspace only.</span></Card>
+      <Card className="channel-preview-note"><span className="notice-icon"><Lightbulb size={17} /></span><span><strong>Mock workspace</strong> Channel statuses, publishing preferences, and video totals are sample data. Connections and settings update this browser workspace only.</span></Card>
       {editingId !== undefined && <ChannelEditor channelId={editingId ?? undefined} onClose={() => setEditingId(undefined)} />}
       {selectedChannel && <ChannelDetailsDialog
-        channel={channelRows.find(channel => channel.id === selectedChannel.id) ?? selectedChannel}
-        onClose={() => setSelectedChannel(null)}
+        channel={selectedChannel}
+        onClose={() => setSelectedChannelId(null)}
         onConnect={() => {
           actions.updateChannel(selectedChannel.id, { status: 'connected' })
         }}
@@ -509,12 +510,13 @@ function ProviderDialog({
 }: {
   provider: AIProvider | null
   onClose: () => void
-  onSave: (draft: ProviderDraft) => OperationResult
+  onSave: (draft: ProviderDraft) => OperationResult | Promise<OperationResult>
 }) {
   const submission = useSubmission()
   const ref = useDialog(onClose, submission.pending)
   const { state } = useStore()
   const [name, setName] = useState(provider?.name ?? '')
+  const modelsByCategory = useModelsByCategory()
   const [category, setCategory] = useState<ProviderCategory>(provider?.category ?? 'Text generation')
   const [model, setModel] = useState(provider?.models[0] ?? modelsByCategory['Text generation'][0])
   const [enabled, setEnabled] = useState(provider?.enabled ?? true)
@@ -597,17 +599,17 @@ function ProvidersPage() {
   const openAddDialog = () => setDialogProvider(null)
   const closeDialog = () => setDialogProvider(undefined)
 
-  const saveProvider = (draft: ProviderDraft): OperationResult => {
-    const result = dialogProvider ? actions.updateProvider(dialogProvider.id, { name: draft.name, category: draft.category, models: [draft.model], enabled: draft.enabled }) : actions.addProvider({ id: `mock-provider-${crypto.randomUUID()}`, name: draft.name, category: draft.category, connected: false, enabled: draft.enabled, models: [draft.model], lastUsed: 'Never', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+  const saveProvider = async (draft: ProviderDraft): Promise<OperationResult> => {
+    const result = await (dialogProvider ? actions.updateProvider(dialogProvider.id, { name: draft.name, category: draft.category, models: [draft.model], enabled: draft.enabled }) : actions.addProvider({ id: `mock-provider-${crypto.randomUUID()}`, name: draft.name, category: draft.category, connected: false, enabled: draft.enabled, models: [draft.model], lastUsed: 'Never', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }))
     if (result.ok) { setTestMessage(''); closeDialog() }
     return result
   }
 
-  const testProvider = (providerId: string) => {
+  const testProvider = async (providerId: string) => {
     const provider = providers.find(item => item.id === providerId)
     const providerName = provider?.name ?? 'provider'
     if (!provider) return
-    const result = actions.updateProvider(provider.id, { connected: true })
+    const result = await actions.updateProvider(provider.id, { connected: true })
     if (!result.ok) return
     setTestMessage(`Mock connection test for ${providerName} passed. No API was called.`)
   }
@@ -693,7 +695,7 @@ function PipelineBuilderDialog({
 }: {
   pipeline: Pipeline | null
   onClose: () => void
-  onSave: (pipeline: Pipeline) => OperationResult
+  onSave: (pipeline: Pipeline) => OperationResult | Promise<OperationResult>
 }) {
   const submission = useSubmission()
   const ref = useDialog(onClose, submission.pending)
@@ -793,7 +795,7 @@ function PipelineBuilderDialog({
                     <Button type="button" variant="quiet" iconOnly icon={<ChevronUp size={15} />} aria-label={`Move ${step.kind} up`} disabled={index === 0} title={index === 0 ? 'This step is already first' : 'Move step up'} onClick={() => { submission.clear(); moveStep(index, -1) }} />
                     <Button type="button" variant="quiet" iconOnly icon={<ChevronDown size={15} />} aria-label={`Move ${step.kind} down`} disabled={index === steps.length - 1} title={index === steps.length - 1 ? 'This step is already last' : 'Move step down'} onClick={() => { submission.clear(); moveStep(index, 1) }} />
                   </div>
-                  <label className="pipeline-step-enable"><input type="checkbox" checked={step.enabled} onChange={(event) => updateStep(step.id, (current) => ({ ...current, enabled: event.target.checked }))} /><span>{step.enabled ? 'On' : 'Off'}</span></label>
+                  <label className="pipeline-step-enable"><input type="checkbox" aria-label={`${step.enabled ? 'Disable' : 'Enable'} ${step.kind} step`} checked={step.enabled} onChange={(event) => updateStep(step.id, (current) => ({ ...current, enabled: event.target.checked }))} /><span>{step.enabled ? 'On' : 'Off'}</span></label>
                   <Button type="button" variant="quiet" iconOnly icon={<Trash2 size={15} />} aria-label={`Remove ${step.kind} step`} onClick={() => { submission.clear(); removeStep(step.id) }} />
                 </div>
                 <div className="pipeline-step-config">
@@ -818,13 +820,14 @@ function WorkflowsPage() {
   const pipelines = usePipelineRows()
   const channelRows = useChannelRows()
   const [editingPipeline, setEditingPipeline] = useState<Pipeline | null | undefined>(undefined)
+  const [detailsPipelineId, setDetailsPipelineId] = useState<string | null>(null)
   const [savedMessage, setSavedMessage] = useState('')
   const enabledCount = pipelines.filter((pipeline) => pipeline.enabled).length
   const totalSteps = pipelines.reduce((total, pipeline) => total + pipeline.steps.filter((step) => step.enabled).length, 0)
 
-  const savePipeline = (pipeline: Pipeline) => {
+  const savePipeline = async (pipeline: Pipeline) => {
     const value = { ...pipeline, assignedChannelIds: pipeline.assignedChannels, steps: pipeline.steps.map((step, order) => ({ ...step, order })), createdAt: state.pipelines.get(pipeline.id)?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() }
-    const result = editingPipeline ? actions.updatePipeline(editingPipeline.id, value) : actions.addPipeline(value)
+    const result = await (editingPipeline ? actions.updatePipeline(editingPipeline.id, value) : actions.addPipeline(value))
     if (!result.ok) return result
     setSavedMessage(`“${pipeline.name}” saved to your mock pipeline library.`)
     setEditingPipeline(undefined)
@@ -865,41 +868,41 @@ function WorkflowsPage() {
                 {pipeline.steps.filter((step) => step.enabled).map((step, index, activeSteps) => <span key={step.id}>{step.kind}{index < activeSteps.length - 1 && <ArrowRight size={12} aria-hidden="true" />}</span>)}
                 {pipeline.steps.every((step) => !step.enabled) && <span className="pipeline-flow-empty">No active steps</span>}
               </div>
+              {[...state.jobs.values()].filter(job => job.execution?.pipelineId === pipeline.id).slice(-3).map(job => <p key={job.id} className="dialog-note"><Link to={`/content?content=${encodeURIComponent(job.contentId)}`}>{state.content.get(job.contentId)?.title ?? 'Content'}</Link> · {job.execution!.paused ? 'Paused' : job.execution!.status} · {job.execution!.progress}%</p>)}
+              <Button variant="quiet" onClick={() => setDetailsPipelineId(pipeline.id)}>Pipeline details & executions</Button>
               <div className="pipeline-card-footer pipeline-library-footer"><span>Reusable workflow definition <strong>· mock only</strong></span><div><Button variant="quiet" onClick={() => togglePipeline(pipeline.id)}>{pipeline.enabled ? 'Disable' : 'Enable'}</Button><Button variant="secondary" icon={<Settings2 size={14} />} onClick={() => setEditingPipeline(pipeline)}>Edit pipeline</Button><Button variant="quiet" onClick={() => actions.requestDelete('pipeline', pipeline.id)}>Delete</Button></div></div>
             </Card>
           ))}
         </div>
       )}
-      <Card className="pipeline-preview-note"><span className="notice-icon"><Lightbulb size={17} /></span><div><strong>Designed for a future execution layer</strong><p>Each step stores an ordered type, enabled state, provider assignment, and instructions. In this phase, saving only updates shared in-memory state—no AI, processing, upload, or scheduling work is run.</p></div></Card>
+      <Card className="pipeline-preview-note"><span className="notice-icon"><Lightbulb size={17} /></span><div><strong>Mock execution available</strong><p>Open a content item’s Details to run its configured steps, pause, resume, cancel, or retry. No AI, media processing, or real publishing service is connected.</p></div></Card>
       {editingPipeline !== undefined && <PipelineBuilderDialog pipeline={editingPipeline} onClose={() => setEditingPipeline(undefined)} onSave={savePipeline} />}
+      {detailsPipelineId && <PipelineDetailsDialog pipelineId={detailsPipelineId} onClose={() => setDetailsPipelineId(null)} />}
     </>
   )
 }
 
-function formatContentDate(value: string): string {
+function formatContentDate(value: string, timezone = 'UTC'): string {
   if (!value) return '—'
+  if (value.length === 16 || value.length === 10) return formatWallTime(value, { month: 'short', day: 'numeric', year: 'numeric', ...(value.length > 10 ? { hour: 'numeric', minute: '2-digit' } : {}) })
   const date = new Date(value.length === 10 ? `${value}T12:00:00` : value)
   return new Intl.DateTimeFormat(undefined, {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
-    ...(value.length > 10 ? { hour: 'numeric', minute: '2-digit' } : {}),
+    ...(value.length > 10 ? { hour: 'numeric', minute: '2-digit' } : {}), timeZone: timezone,
   }).format(date)
 }
 
-function ContentDetailsDialog({ item, onClose }: { item: ContentItem; onClose: () => void }) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose])
+function ContentDetailsDialog({ item, onClose, onEdit, onSchedule }: { item: ContentItem; onClose: () => void; onEdit: () => void; onSchedule: () => void }) {
+  const { state } = useStore()
+  const timezone = state.preferences?.timezone ?? 'UTC'
+  const ref = useDialog(onClose, false)
   const activeStep = item.status === 'Failed' ? -1 : contentStatuses.indexOf(item.status)
 
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <section className="dialog content-dialog content-details-dialog" role="dialog" aria-modal="true" aria-labelledby="content-details-title">
+      <section ref={ref} tabIndex={-1} className="dialog content-dialog content-details-dialog" role="dialog" aria-modal="true" aria-labelledby="content-details-title">
         <div className="dialog-header"><div className="dialog-icon"><Video size={19} /></div><Button variant="ghost" iconOnly icon={<X size={18} />} aria-label="Close content details" onClick={onClose} /></div>
         <div className="content-details-title"><div><h2 id="content-details-title">{item.title}</h2><p>{item.channel} · {item.format}</p></div><Badge tone={contentStatusTone[item.status]} dot>{item.status}</Badge></div>
         <VideoThumbnail kind={item.image} />
@@ -910,29 +913,39 @@ function ContentDetailsDialog({ item, onClose }: { item: ContentItem; onClose: (
         </div>
         <dl className="content-details-grid">
           <div><dt>Pipeline</dt><dd>{item.pipeline}</dd></div>
-          <div><dt>Created</dt><dd>{formatContentDate(item.createdAt)}</dd></div>
-          <div><dt>Scheduled date</dt><dd>{formatContentDate(item.scheduledAt)}</dd></div>
+          <div><dt>Created</dt><dd>{formatContentDate(item.createdAt, timezone)}</dd></div>
+          <div><dt>Scheduled date</dt><dd>{formatContentDate(item.scheduledAt, timezone)}</dd></div>
           <div><dt>Publishing preference</dt><dd>{item.publishPreference}</dd></div>
           <div className="content-detail-notes"><dt>Notes</dt><dd>{item.notes || 'No notes added.'}</dd></div>
         </dl>
-        <p className="dialog-note">Status and dates are illustrative mock data; no pipeline or publishing service is connected.</p>
+        <PipelineExecutionPanel contentId={item.id} />
+        <div className="dialog-footer"><Button onClick={onEdit}>Edit content</Button>{canScheduleContent(state, item.id) && <Button variant="primary" onClick={onSchedule}>Schedule ready content</Button>}{item.status === 'Scheduled' && <Link to="/scheduler">View scheduled job</Link>}{item.status === 'Published' && <p role="status">Mock publication complete. Jobs and activity are available below.</p>}</div>
+        <JobQueuePanel contentId={item.id} />
       </section>
     </div>
   )
 }
 
 function ContentPage() {
-  const { actions } = useStore()
+  const { state, actions } = useStore()
   const items = useContentRows()
   const channelRows = useChannelRows()
   const initialPipelines = usePipelineRows()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const selectedItem = items.find(item => item.id === searchParams.get('content')) ?? null
+  const setSelectedItem = (item: ContentItem | null) => setSearchParams(previous => { const next = new URLSearchParams(previous); if (item) next.set('content', item.id); else next.delete('content'); return next })
+  const [scheduleContentId, setScheduleContentId] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null | undefined>(undefined)
-  const [search, setSearch] = useState('')
+  const search = searchParams.get('search') ?? ''
+  const setSearch = (value: string) => setSearchParams(previous => { const next = new URLSearchParams(previous); if (value) next.set('search', value); else next.delete('search'); return next }, { replace: true })
+  const searchRef = useRef<HTMLInputElement>(null)
+  const focusSearch = searchParams.get('focus') === 'search'
+  useEffect(() => { if (focusSearch) searchRef.current?.focus() }, [focusSearch])
   const [channelFilter, setChannelFilter] = useState('all')
   const [statusFilter, setStatusFilter] = useState('all')
   const [pipelineFilter, setPipelineFilter] = useState('all')
   const [dateFilter, setDateFilter] = useState('all')
-  const [selectedItem, setSelectedItem] = useState<ContentItem | null>(null)
+  const [contentReferenceTime] = useState(() => Date.now())
 
   const normalizedSearch = search.trim().toLowerCase()
   const visibleItems = items.filter((item) => {
@@ -947,17 +960,18 @@ function ContentPage() {
   }).sort((first, second) => second.createdAt.localeCompare(first.createdAt))
 
   const inProgressCount = items.filter((item) => ['Script', 'Generating', 'Editing', 'Ready'].includes(item.status)).length
-  const scheduledCount = items.filter((item) => Boolean(item.scheduledAt)).length
+  const scheduledCount = workspaceCounts(state).scheduled
   const publishedCount = items.filter((item) => item.status === 'Published').length
 
   return (
     <>
       <PageHeading eyebrow="EVERY IDEA HAS A HOME" title="Content" description="Keep the drafts, works-in-progress, and published stories moving." action={<AddButton onClick={() => setEditingId(null)}>Create content</AddButton>} />
+      {searchParams.get('content') && !selectedItem && <EmptyState icon={<Video size={18} />} title="Content unavailable" description="This content was removed or the link is no longer available." action={<Button onClick={() => setSelectedItem(null)}>Close unavailable item</Button>} />}
       <div className="content-summary-strip" aria-label="Content summary"><span><strong>{items.length}</strong> total pieces</span><i /><span><strong>{inProgressCount}</strong> in progress</span><i /><span><strong>{scheduledCount}</strong> scheduled</span><i /><span><strong>{publishedCount}</strong> published</span></div>
 
       <Card className="content-table-card">
         <div className="content-filter-toolbar">
-          <label className="content-search"><Search size={15} /><input aria-label="Search content" placeholder="Search titles, channels, pipelines…" value={search} onChange={(event) => setSearch(event.target.value)} />{search && <button type="button" aria-label="Clear search" onClick={() => setSearch('')}><X size={14} /></button>}</label>
+          <label className="content-search"><Search size={15} /><input ref={searchRef} aria-label="Search content" placeholder="Search titles, channels, pipelines…" value={search} onChange={(event) => setSearch(event.target.value)} />{search && <button type="button" aria-label="Clear search" onClick={() => setSearch('')}><X size={14} /></button>}</label>
           <div className="content-filter-controls">
             <Select aria-label="Filter by channel" value={channelFilter} onChange={(event) => setChannelFilter(event.target.value)}><option value="all">All channels</option>{channelRows.map((channel) => <option value={channel.name} key={channel.name}>{channel.name}</option>)}</Select>
             <Select aria-label="Filter by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">All statuses</option>{contentStatuses.map((status) => <option value={status} key={status}>{status}</option>)}</Select>
@@ -976,16 +990,17 @@ function ContentPage() {
               <td><span className="table-channel"><span className={`tiny-channel ${item.channel === 'Creative Growth' ? 'purple-dot' : 'green-dot'}`} />{item.channel}</span></td>
               <td className="content-pipeline-cell">{item.pipeline}</td>
               <td><Badge tone={contentStatusTone[item.status]} dot>{item.status}</Badge></td>
-              <td className="table-date">{formatContentDate(item.createdAt)}</td>
-              <td className="table-date">{formatContentDate(item.scheduledAt)}</td>
+              <td className="table-date">{formatContentDate(item.createdAt, state.preferences?.timezone)}</td>
+              <td className="table-date">{formatContentDate(item.scheduledAt, state.preferences?.timezone)}</td>
               <td><Button variant="quiet" className="content-details-action" onClick={() => setSelectedItem(item)}>Details</Button><Button variant="quiet" onClick={() => setEditingId(item.id)}>Edit</Button><Button variant="quiet" onClick={() => actions.requestDelete('content', item.id)}>Delete</Button></td>
             </tr>)}</tbody></table></div>
-            <div className="table-footer"><span>Showing {visibleItems.length} of {items.length} pieces</span><span className="content-mock-label">Mock content · in-memory workspace</span></div>
+            <div className="table-footer"><span>Showing {visibleItems.length} of {items.length} pieces</span><span className="content-mock-label">Mock content · browser workspace</span></div>
           </>
         )}
       </Card>
-      {editingId !== undefined && <ContentEditor contentId={editingId ?? undefined} onClose={() => setEditingId(undefined)} />}
-      {selectedItem && items.some(item => item.id === selectedItem.id) && <ContentDetailsDialog item={items.find(item => item.id === selectedItem.id)!} onClose={() => setSelectedItem(null)} />}
+      {editingId !== undefined && <ContentEditor contentId={editingId ?? undefined} onClose={() => setEditingId(undefined)} onSaved={id => setSearchParams({ content: id })} />}
+      {selectedItem && <ContentDetailsDialog item={selectedItem} onClose={() => setSelectedItem(null)} onEdit={() => { setEditingId(selectedItem.id); setSelectedItem(null) }} onSchedule={() => { setScheduleContentId(selectedItem.id); setSelectedItem(null) }} />}
+      {scheduleContentId && <ScheduleEditor initialContentId={scheduleContentId} onClose={() => { setSearchParams({ content: scheduleContentId }); setScheduleContentId(null) }} />}
     </>
   )
 }
@@ -998,28 +1013,27 @@ const scheduleStatusTone: Record<ScheduleStatus, 'blue' | 'green' | 'amber' | 'r
 }
 
 function scheduledDateLabel(value: string, includeWeekday = true): string {
-  const date = new Date(value)
-  return new Intl.DateTimeFormat(undefined, {
+  return formatWallTime(value, {
     ...(includeWeekday ? { weekday: 'short' } : {}),
     month: 'short',
     day: 'numeric',
     year: 'numeric',
-  }).format(date)
+  })
 }
 
 function scheduledTimeLabel(value: string): string {
-  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(value))
+  return formatWallTime(value, { hour: 'numeric', minute: '2-digit' })
 }
 
 function getMonday(date: Date): Date {
-  const monday = new Date(date.getFullYear(), date.getMonth(), date.getDate())
-  monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7))
+  const monday = new Date(date)
+  monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7))
   return monday
 }
 
 function addCalendarDays(date: Date, days: number): Date {
-  const result = new Date(date.getFullYear(), date.getMonth(), date.getDate())
-  result.setDate(result.getDate() + days)
+  const result = new Date(date)
+  result.setUTCDate(result.getUTCDate() + days)
   return result
 }
 
@@ -1030,7 +1044,7 @@ function SchedulerDetailsDialog({
 }: {
   item: ScheduledVideo
   onClose: () => void
-  onReschedule: (id: string, scheduledAt: string) => OperationResult
+  onReschedule: (id: string, scheduledAt: string) => OperationResult | Promise<OperationResult>
 }) {
   const submission = useSubmission()
   const ref = useDialog(onClose, submission.pending)
@@ -1050,7 +1064,7 @@ function SchedulerDetailsDialog({
         <div className="dialog-header"><div className="dialog-icon"><CalendarClock size={19} /></div><Button variant="ghost" iconOnly icon={<X size={18} />} aria-label="Close schedule details" onClick={onClose} disabled={submission.pending} /></div>
         <div className="schedule-details-heading"><div><h2 id="schedule-details-title">{item.title}</h2><p>{item.channel} · {item.pipeline}</p></div><Badge tone={scheduleStatusTone[item.status]} dot>{item.status}</Badge></div>
         <VideoThumbnail kind={item.thumbnail} />
-        <div className="schedule-detail-time"><CalendarDays size={15} /><span><strong>{scheduledDateLabel(item.scheduledAt)}</strong><small>{scheduledTimeLabel(item.scheduledAt)} · {state.preferences?.timezone ?? 'Asia/Colombo'}</small></span></div>
+        <div className="schedule-detail-time"><CalendarDays size={15} /><span><strong>{scheduledDateLabel(item.scheduledAt)}</strong><small>{scheduledTimeLabel(item.scheduledAt)} · {state.preferences?.timezone ?? 'UTC'}</small></span></div>
         <div className="schedule-details-metadata"><div><span>CHANNEL</span><strong>{item.channel}</strong></div><div><span>PIPELINE</span><strong>{item.pipeline}</strong></div><div><span>CURRENT STATUS</span><strong>{item.status}</strong></div></div>
         {!rescheduling ? (
           <div className="dialog-footer"><Button variant="secondary" onClick={onClose}>Done</Button><Button variant="primary" icon={<CalendarClock size={14} />} onClick={() => setRescheduling(true)}>Reschedule</Button></div>
@@ -1070,6 +1084,7 @@ function SchedulerDetailsDialog({
 
 function SchedulerPage() {
   const { state, actions } = useStore()
+  const timezone = state.preferences?.timezone ?? 'UTC'
   const items = useScheduledVideoRows()
   const canCreateSchedule = Array.from(state.content.values()).some(item => item.status === 'Ready' && !Array.from(state.scheduledVideos.values()).some(schedule => schedule.contentId === item.id))
   const channelRows = useChannelRows()
@@ -1079,21 +1094,18 @@ function SchedulerPage() {
   const [specificDate, setSpecificDate] = useState('')
   const [calendarView, setCalendarView] = useState<'week' | 'month'>('week')
   const [calendarAnchor, setCalendarAnchor] = useState(() => {
-    const now = new Date()
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    return calendarDate(workspaceToday(timezone))
   })
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
   const [rescheduledMessage, setRescheduledMessage] = useState('')
 
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
+  const today = calendarDate(workspaceToday(timezone))
   const filteredItems = items.filter((item) => {
     if (channelFilter !== 'all' && item.channel !== channelFilter) return false
-    const scheduledDate = new Date(item.scheduledAt)
-    const scheduledDay = new Date(scheduledDate.getFullYear(), scheduledDate.getMonth(), scheduledDate.getDate())
+    const scheduledDay = calendarDate(item.scheduledAt)
     if (dateFilter === 'next-7-days' && (scheduledDay < today || scheduledDay > addCalendarDays(today, 6))) return false
     if (dateFilter === 'next-30-days' && (scheduledDay < today || scheduledDay > addCalendarDays(today, 29))) return false
-    if (specificDate && localDateKey(scheduledDate) !== specificDate) return false
+    if (specificDate && item.scheduledAt.slice(0, 10) !== specificDate) return false
     return true
   }).sort((first, second) => first.scheduledAt.localeCompare(second.scheduledAt))
 
@@ -1102,23 +1114,23 @@ function SchedulerPage() {
   const calendarDays = calendarView === 'week'
     ? Array.from({ length: 7 }, (_, index) => addCalendarDays(weekStart, index))
     : (() => {
-      const monthStart = new Date(calendarAnchor.getFullYear(), calendarAnchor.getMonth(), 1)
+      const monthStart = new Date(Date.UTC(calendarAnchor.getUTCFullYear(), calendarAnchor.getUTCMonth(), 1, 12))
       const gridStart = getMonday(monthStart)
       return Array.from({ length: 42 }, (_, index) => addCalendarDays(gridStart, index))
     })()
-  const visibleCalendarItems = (day: Date) => filteredItems.filter((item) => localDateKey(new Date(item.scheduledAt)) === localDateKey(day))
+  const visibleCalendarItems = (day: Date) => filteredItems.filter((item) => item.scheduledAt.slice(0, 10) === calendarKey(day))
   const windowLabel = calendarView === 'week'
     ? `${scheduledDateLabel(localDateTime(weekStart, 12, 0), false)} – ${scheduledDateLabel(localDateTime(addCalendarDays(weekStart, 6), 12, 0), false)}`
-    : new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(calendarAnchor)
+    : new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(calendarAnchor)
 
   const navigateCalendar = (direction: -1 | 1) => {
     setCalendarAnchor((current) => calendarView === 'week'
       ? addCalendarDays(current, direction * 7)
-      : new Date(current.getFullYear(), current.getMonth() + direction, 1))
+      : new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + direction, 1, 12)))
   }
 
-  const rescheduleItem = (id: string, scheduledAt: string) => {
-    const result = actions.updateScheduledVideo(id, { scheduledAt })
+  const rescheduleItem = async (id: string, scheduledAt: string) => {
+    const result = await actions.updateScheduledVideo(id, { scheduledAt })
     if (!result.ok) return result
     setRescheduledMessage('Upload time updated in this mock schedule.')
     setSelectedItemId(null)
@@ -1150,7 +1162,7 @@ function SchedulerPage() {
               <Button variant="secondary" iconOnly icon={<ChevronLeft size={15} />} aria-label="Previous calendar period" onClick={() => navigateCalendar(-1)} />
               <strong>{windowLabel}</strong>
               <Button variant="secondary" iconOnly icon={<ArrowRight size={15} />} aria-label="Next calendar period" onClick={() => navigateCalendar(1)} />
-              <Button variant="quiet" onClick={() => setCalendarAnchor(new Date(today.getFullYear(), today.getMonth(), today.getDate()))}>Today</Button>
+              <Button variant="quiet" onClick={() => setCalendarAnchor(new Date(today))}>Today</Button>
             </div>
             <div className="calendar-view" aria-label="Calendar view">
               <Button variant="quiet" className={calendarView === 'week' ? 'calendar-view-active' : ''} aria-pressed={calendarView === 'week'} onClick={() => setCalendarView('week')}>Week</Button>
@@ -1163,9 +1175,9 @@ function SchedulerPage() {
               {calendarDays.map((day) => {
                 const dayItems = visibleCalendarItems(day)
                 const isToday = localDateKey(day) === localDateKey(today)
-                const outsideMonth = day.getMonth() !== calendarAnchor.getMonth()
+                const outsideMonth = day.getUTCMonth() !== calendarAnchor.getUTCMonth()
                 return <div className={`scheduler-calendar-day${isToday ? ' scheduler-day-today' : ''}${outsideMonth && calendarView === 'month' ? ' scheduler-day-outside' : ''}`} key={localDateKey(day)}>
-                  <div className="scheduler-calendar-day-number"><span>{day.getDate()}</span>{dayItems.length > 0 && <small>{dayItems.length} upload{dayItems.length === 1 ? '' : 's'}</small>}</div>
+                  <div className="scheduler-calendar-day-number"><span>{day.getUTCDate()}</span>{dayItems.length > 0 && <small>{dayItems.length} upload{dayItems.length === 1 ? '' : 's'}</small>}</div>
                   <div className="scheduler-calendar-day-items">{dayItems.map((item) => <button className={`scheduler-calendar-event scheduler-event-${scheduleStatusTone[item.status]}`} key={item.id} onClick={() => setSelectedItemId(item.id)} aria-label={`${item.title}, ${scheduledTimeLabel(item.scheduledAt)}, ${item.status}`}>
                     <time>{scheduledTimeLabel(item.scheduledAt)}</time><strong>{item.title}</strong><small>{item.channel}</small>
                   </button>)}</div>
@@ -1179,7 +1191,7 @@ function SchedulerPage() {
           <SectionHeading title="Upcoming uploads" action={<Badge tone="blue">{filteredItems.length} scheduled</Badge>} />
           <p className="scheduler-panel-subtitle">Your next uploads, in publishing order.</p>
           {filteredItems.length > 0 ? <div className="scheduler-agenda-list">{filteredItems.slice(0, 6).map((item) => <button className="scheduler-agenda-item" key={item.id} onClick={() => setSelectedItemId(item.id)}>
-            <div className="scheduler-agenda-date"><span>{new Intl.DateTimeFormat(undefined, { month: 'short' }).format(new Date(item.scheduledAt))}</span><strong>{new Date(item.scheduledAt).getDate()}</strong></div>
+            <div className="scheduler-agenda-date"><span>{formatWallTime(item.scheduledAt, { month: 'short' })}</span><strong>{Number(item.scheduledAt.slice(8, 10))}</strong></div>
             <div className="scheduler-agenda-copy"><strong>{item.title}</strong><span>{item.channel} · {scheduledTimeLabel(item.scheduledAt)}</span><Badge tone={scheduleStatusTone[item.status]} dot>{item.status}</Badge></div>
           </button>)}</div> : <EmptyState icon={<CalendarDays size={19} />} title="Nothing scheduled here" description="Try another channel or date range to see upcoming uploads." action={<Button variant="secondary" onClick={clearFilters}>Clear filters</Button>} />}
         </Card>
@@ -1194,6 +1206,7 @@ function SchedulerPage() {
           <div className="scheduled-video-card-actions"><Button variant="quiet" onClick={() => setEditingId(item.id)}>Edit</Button><Button variant="quiet" onClick={() => actions.requestDelete('schedule', item.id)}>Delete</Button><Button variant="quiet" onClick={() => setSelectedItemId(item.id)}>Details</Button><Button variant="secondary" icon={<CalendarClock size={13} />} onClick={() => setSelectedItemId(item.id)}>Reschedule</Button></div>
         </div>
       </Card>)}</div> : <EmptyState icon={<Video size={21} />} title="No scheduled videos" description="There are no mock uploads matching your current filters." />}
+      <JobQueuePanel />
       {editingId !== undefined && <ScheduleEditor scheduleId={editingId ?? undefined} onClose={() => setEditingId(undefined)} />}
       {selectedItem && <SchedulerDetailsDialog item={selectedItem} onClose={() => setSelectedItemId(null)} onReschedule={rescheduleItem} />}
     </>
@@ -1289,12 +1302,13 @@ function AnalyticsPage() {
   const visibleChannels = channelRows.filter((channel) => channelFilter === 'all' || channel.name === channelFilter)
   const channelMetrics = visibleChannels.map((channel) => {
     const videos = filteredVideos.filter((video) => video.channel === channel.name)
+    const views = videos.reduce((total, video) => total + video.views, 0)
     return {
       ...channel,
-      views: videos.reduce((total, video) => total + video.views, 0),
+      views,
       subscribers: videos.reduce((total, video) => total + video.subscribersGained, 0),
       watchTimeHours: videos.reduce((total, video) => total + video.watchTimeHours, 0),
-      engagement: videos.length ? videos.reduce((total, video) => total + video.engagementRate * video.views, 0) / videos.reduce((total, video) => total + video.views, 0) : 0,
+      engagement: views ? videos.reduce((total, video) => total + video.engagementRate * video.views, 0) / views : 0,
     }
   })
   const pipelineMetrics = initialPipelines.map((pipeline) => {
@@ -1302,7 +1316,7 @@ function AnalyticsPage() {
     return { name: pipeline.name, views: videos.reduce((total, video) => total + video.views, 0), count: videos.length }
   }).filter((pipeline) => pipeline.count > 0)
   const maxPipelineViews = Math.max(1, ...pipelineMetrics.map((pipeline) => pipeline.views))
-  const averagePrevious = filteredVideos.length ? '+8.4% vs. previous period' : 'No comparison available'
+  const averagePrevious = 'No period comparison available'
 
   return (
     <>
@@ -1402,6 +1416,10 @@ const initialSettings: SettingsValues = {
   imageProvider: '',
 }
 
+function settingsFromPreferences(preferences: UserPreferences | null): SettingsValues {
+  return { ...initialSettings, ...preferences, defaultChannel: preferences?.defaultChannelId ?? '', defaultPipeline: preferences?.defaultPipelineId ?? '', textProvider: preferences?.textProviderId ?? '', voiceProvider: preferences?.voiceProviderId ?? '', imageProvider: preferences?.imageProviderId ?? '' }
+}
+
 const settingsSections = [
   { id: 'settings-general', label: 'General', icon: Settings2 },
   { id: 'settings-appearance', label: 'Appearance', icon: Palette },
@@ -1413,13 +1431,14 @@ const settingsSections = [
 ]
 
 function SettingsPage() {
-  const { state, actions } = useStore()
+  const { state, actions, remote } = useStore()
+  const auth = useOptionalAuth()
   const channelRows = useChannelRows()
   const initialPipelines = usePipelineRows()
   const initialProviders = useProviderRows()
   const preferences = state.preferences
   const submission = useSubmission()
-  const [settings, setSettings] = useState<SettingsValues>(() => ({ ...initialSettings, ...preferences, defaultChannel: preferences?.defaultChannelId ?? '', defaultPipeline: preferences?.defaultPipelineId ?? '', textProvider: preferences?.textProviderId ?? '', voiceProvider: preferences?.voiceProviderId ?? '', imageProvider: preferences?.imageProviderId ?? '' }))
+  const [settings, setSettings] = useState<SettingsValues>(() => settingsFromPreferences(preferences))
   const [savedMessage, setSavedMessage] = useState('')
   const [activeSection, setActiveSection] = useState(() => {
     const initialHash = window.location.hash.slice(1)
@@ -1438,7 +1457,7 @@ function SettingsPage() {
   return (
     <>
       <PageHeading eyebrow="MAKE YOURSELF AT HOME" title="Settings" description="Set workspace defaults and preferences for your creative workflow." action={<Button variant="primary" icon={<Save size={15} />} onClick={saveSettings} disabled={submission.pending}>{submission.pending ? 'Saving…' : 'Save preferences'}</Button>} />
-      <Card className="settings-preview-banner"><span className="notice-icon"><Lightbulb size={17} /></span><div><strong>Settings preview</strong><p>Changes are shared in-memory state only. Nothing is stored or connected to an account or external service.</p></div><Badge tone="neutral">UI only</Badge></Card>
+      <Card className="settings-preview-banner"><span className="notice-icon"><Lightbulb size={17} /></span><div><strong>{remote ? 'Account workspace' : 'Browser workspace'}</strong><p>{remote ? 'Changes are saved to your authenticated backend account. Browser backups remain separate until you explicitly import them.' : 'Workspace changes are saved in this browser when storage is available. No account or external service is connected.'}</p></div><Button variant="secondary" onClick={actions.requestReset}>Reset workspace</Button></Card>
       {savedMessage && <div className="content-created-message settings-saved-message" role="status"><CheckCircle2 size={15} />{savedMessage}<button type="button" aria-label="Dismiss notification" onClick={() => setSavedMessage('')}><X size={15} /></button></div>}
       <OperationFeedback result={submission.result} pending={submission.pending} /><fieldset className="editor-fields" disabled={submission.pending}><div className="settings-layout">
         <nav className="settings-nav" aria-label="Settings sections">{settingsSections.map(({ id, label, icon: Icon }) => <a key={id} href={`#${id}`} onClick={() => setActiveSection(id)} className={activeSection === id ? 'settings-nav-active' : undefined} aria-current={activeSection === id ? 'location' : undefined}><Icon size={15} /><span>{label}</span></a>)}</nav>
@@ -1493,19 +1512,19 @@ function SettingsPage() {
             <p className="settings-inline-note"><Sparkles size={13} />These are preferred provider labels only; no AI provider is called.</p>
           </Card>
           <Card className="settings-card" id="settings-account">
-            <div className="settings-card-heading"><span><ShieldCheck size={17} /></span><div><h2>Account & security</h2><p>Account controls shown for interface completeness. No authentication is active.</p></div></div>
-            <div className="settings-account-summary"><Avatar initials="JD" className="channel-purple" /><div><strong>Jordan Davis</strong><span><Mail size={12} />jordan@example.com</span></div><Badge tone="neutral">Preview account</Badge></div>
+            <div className="settings-card-heading"><span><ShieldCheck size={17} /></span><div><h2>Account & security</h2><p>{remote ? 'Authenticated with a secure backend cookie session.' : 'Account controls shown for interface completeness. No authentication is active.'}</p></div></div>
+            <div className="settings-account-summary"><Avatar initials={auth?.user?.displayName.slice(0, 2).toUpperCase() ?? 'JD'} className="channel-purple" /><div><strong>{auth?.user?.displayName ?? 'Jordan Davis'}</strong><span><Mail size={12} />{auth?.user?.email ?? 'jordan@example.com'}</span></div><Badge tone="neutral">{remote ? 'Signed in' : 'Preview account'}</Badge></div>
             <div className="settings-security-rows">
-              <div><span className="settings-security-icon"><LockKeyhole size={15} /></span><span><strong>Password & sign-in</strong><small>Password management is not available in this UI-only phase.</small></span><Button variant="secondary" disabled>Unavailable</Button></div>
+              <div><span className="settings-security-icon"><LockKeyhole size={15} /></span><span><strong>Password & sign-in</strong><small>{remote ? 'Password changes are supported by the backend API; this settings form is not connected yet.' : 'Password management is not available in this UI-only phase.'}</small></span><Button variant="secondary" disabled>Unavailable</Button></div>
               <div><span className="settings-security-icon"><ShieldCheck size={15} /></span><span><strong>Two-factor authentication</strong><small>Security setup requires a future authentication service.</small></span><Button variant="secondary" disabled>Not configured</Button></div>
-              <div><span className="settings-security-icon"><Radio size={15} /></span><span><strong>Active sessions</strong><small>Session management is a placeholder; no sessions are tracked.</small></span><Button variant="secondary" disabled>Preview only</Button></div>
+              <div><span className="settings-security-icon"><Radio size={15} /></span><span><strong>Active sessions</strong><small>{remote ? 'Your session is tracked by the backend and expires after inactivity.' : 'Session management is a placeholder; no sessions are tracked.'}</small></span><Button variant="secondary" disabled={!auth} onClick={() => void submission.submit(async () => { try { await auth?.logout(); return { ok: true, message: 'Signed out.' } } catch (error) { return { ok: false, kind: 'failure', message: error instanceof Error ? error.message : 'Could not sign out.', errors: {} } } })}>{remote ? 'Sign out' : 'Preview only'}</Button></div>
             </div>
           </Card>
         </div>
       </div>
-      </fieldset><div className="settings-bottom-actions"><span><CheckCircle2 size={14} />Unsaved changes stay in this page only.</span><Button variant="quiet" icon={<RotateCcw size={14} />} disabled={submission.pending} onClick={() => { setSettings(initialSettings); setSavedMessage('Preview preferences reset to their original mock values.') }}>Reset preview</Button><Button variant="primary" icon={<Save size={14} />} onClick={saveSettings} disabled={submission.pending}>{submission.pending ? 'Saving…' : 'Save preferences'}</Button></div>
+      </fieldset><div className="settings-bottom-actions"><span><CheckCircle2 size={14} />Unsaved changes stay in this page only.</span><Button variant="quiet" icon={<RotateCcw size={14} />} disabled={submission.pending} onClick={() => { setSettings(settingsFromPreferences(preferences)); submission.clear(); setSavedMessage('Unsaved changes reset to the saved workspace preferences.') }}>Reset unsaved changes</Button><Button variant="primary" icon={<Save size={14} />} onClick={saveSettings} disabled={submission.pending}>{submission.pending ? 'Saving…' : 'Save preferences'}</Button></div>
     </>
   )
 }
 
-export { ProviderDialog, PipelineBuilderDialog, SchedulerDetailsDialog, AnalyticsPage, ChannelsPage, ContentPage, DashboardPage, ProvidersPage, SchedulerPage, SettingsPage, WorkflowsPage }
+export { ChannelDetailsDialog, ProviderDialog, PipelineBuilderDialog, SchedulerDetailsDialog, AnalyticsPage, ChannelsPage, ContentPage, DashboardPage, ProvidersPage, SchedulerPage, SettingsPage, WorkflowsPage }

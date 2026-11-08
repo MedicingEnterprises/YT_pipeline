@@ -821,7 +821,7 @@ td:last-child, th:last-child { padding-right: 9px; }
 .dialog-description { margin-bottom: 17px; color: #898b99; font-size: 10px; line-height: 1.6; }
 .field-label { display: block; margin: 12px 0 6px; color: #555665; font-size: 9px; font-weight: 600; }
 .dialog .text-input, .select-full { width: 100%; min-height: 37px; }
-.dialog-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; padding-top: 13px; border-top: 1px solid #f0f0f4; }
+.dialog-footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 20px; padding-top: 13px; border-top: 1px solid #f0f0f4; }
 .dialog-note { margin-top: 11px; color: #a0a2ae; font-size: 8px; text-align: center; }
 
 .dashboard-stat-grid .stat-card { min-height: 79px; }
@@ -1135,6 +1135,8 @@ td:last-child, th:last-child { padding-right: 9px; }
 
 /* Validation and operation feedback reuse the existing cards, colors, and controls. */
 .editor-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.search-trigger { display: inline-grid; place-items: center; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; flex-shrink: 0; }
+.dialog, .job-queue { overflow-wrap: anywhere; }
 .operation-feedback { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin: 12px 0 18px; font-size: 12px; line-height: 1.5; }
 .operation-feedback > svg { flex-shrink: 0; margin-top: 2px; }
 .operation-feedback > div { flex: 1; min-width: 0; }
@@ -1157,3 +1159,7 @@ td:last-child, th:last-child { padding-right: 9px; }
 .provider-dialog .editor-fields > .field-label, .content-dialog .editor-fields > .field-label { margin-top: 11px; }
 .settings-field:has(> .field-error) { flex-wrap: wrap; }
 .settings-field > .field-error { flex: 1 0 100%; text-align: right; margin-top: -7px; margin-bottom: 7px; }
+.auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.auth-screen > .card { width: min(100%, 460px); padding: 28px; }
+.workspace-import { margin-bottom: 18px; padding: 14px 18px; }
+.workspace-import summary { cursor: pointer; }

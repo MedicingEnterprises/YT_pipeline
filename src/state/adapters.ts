@@ -9,6 +9,8 @@ import type {
   ProviderCategory,
 } from '../models'
 import { useStore, useChannels, useProviders, useContent, usePipelines, useScheduledVideos } from './store'
+import { wallTimeNow } from './time'
+import { channelContent, workspaceCounts } from './selectors'
 
 // ============================================================================
 // CHANNEL ADAPTERS
@@ -23,18 +25,18 @@ export function useChannelRows() {
     handle: channel.handle,
     category: channel.category,
     subscribers: channel.subscribers,
-    videos: channel.videos,
+    videos: String(channelContent(state, channel.id).filter(item => item.status === 'Published').length),
     initials: channel.initials,
     color: channel.color,
     connected: channel.status === 'connected',
-    recentActivity: channel.recentActivity,
-    activityTime: channel.activityTime,
+    recentActivity: state.activities.find(activity => activity.relatedChannelId === channel.id || activity.relatedContentId && state.content.get(activity.relatedContentId)?.channelId === channel.id)?.title ?? channel.recentActivity,
+    activityTime: state.activities.find(activity => activity.relatedChannelId === channel.id || activity.relatedContentId && state.content.get(activity.relatedContentId)?.channelId === channel.id)?.time ?? channel.activityTime,
     scheduleDays: channel.scheduleDays,
     scheduleTime: channel.scheduleTime,
-    scheduledCount: Array.from(state.scheduledVideos.values()).filter(item => item.channelId === channel.id).length,
+    scheduledCount: Array.from(state.scheduledVideos.values()).filter(item => item.channelId === channel.id && item.status === 'Scheduled').length,
     publishedCount: Array.from(state.content.values()).filter(item => item.channelId === channel.id && item.status === 'Published').length,
     pipeline: state.pipelines.get(channel.defaultPipelineId ?? '')?.name ?? 'Not assigned',
-    recentUploads: Array.from(state.content.values()).filter(item => item.channelId === channel.id).map(item => ({ id: item.id, title: item.title, status: item.status, date: item.scheduledAt || item.createdAt, tone: item.status === 'Published' ? 'green' as const : 'blue' as const })),
+    recentUploads: channelContent(state, channel.id).map(item => ({ id: item.id, title: item.title, status: item.status, date: item.scheduledAt || item.updatedAt, tone: item.status === 'Published' ? 'green' as const : 'blue' as const })),
   }))
 }
 
@@ -168,27 +170,29 @@ export function useScheduleStatusTone(): Record<ScheduleStatus, 'blue' | 'green'
 // DASHBOARD DATA ADAPTERS
 // ============================================================================
 
-const dashboardReferenceTime = Date.now()
 
 export function useDashboardData() {
   const channels = useChannels()
   const content = useContent()
   const scheduledVideos = useScheduledVideos()
-  const activities = useStore().state.activities
+  const { state } = useStore()
+  const activities = state.activities
+  const activityRows = activities.map(activity => { const item = activity.relatedContentId ? state.content.get(activity.relatedContentId) : undefined; return item ? { ...activity, detail: `${item.title} · ${state.channels.get(item.channelId)?.name ?? 'Unassigned'}` } : activity })
+  const now = wallTimeNow(state.preferences?.timezone ?? 'UTC')
+  const counts = workspaceCounts(state)
   
-  const connectedChannels = channels.filter((ch) => ch.status === 'connected')
   const publishedContent = content.filter((item) => item.status === 'Published')
-  const scheduledContent = scheduledVideos
   const processingContent = content.filter((item) => ['Generating', 'Editing'].includes(item.status))
   
   return {
     overview: [
-      { label: 'Total videos', value: String(content.length), detail: 'Across all channels' },
-      { label: 'Videos scheduled', value: String(scheduledContent.length), detail: 'In this workspace' },
-      { label: 'Videos processing', value: String(processingContent.length), detail: `${content.filter(item => item.status === 'Failed').length} needs attention` },
-      { label: 'Videos published', value: String(publishedContent.length), detail: `Across ${connectedChannels.length} channels` },
+      { label: 'Total videos', value: String(counts.content), detail: 'Across all channels' },
+      { label: 'Videos scheduled', value: String(counts.scheduled), detail: 'Armed for automatic dispatch' },
+      { label: 'Jobs processing', value: String(counts.processing), detail: `${counts.failed} jobs need attention` },
+      { label: 'Videos published', value: String(counts.published), detail: `Across ${new Set(publishedContent.map(item => item.channelId)).size} channels` },
     ],
-    upcomingUploads: scheduledVideos.filter(video => new Date(video.scheduledAt).getTime() >= dashboardReferenceTime).sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt)).slice(0, 3).map((video) => ({
+    upcomingUploads: scheduledVideos.filter(video => video.scheduledAt >= now).sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt)).slice(0, 3).map((video) => ({
+      contentId: video.contentId,
       title: video.title,
       channel: channels.find((ch) => ch.id === video.channelId)?.name || 'Unassigned',
       scheduledAt: video.scheduledAt,
@@ -196,7 +200,8 @@ export function useDashboardData() {
       tone: video.status === 'Scheduled' ? 'blue' as const : 'amber' as const,
       thumbnail: video.thumbnail,
     })),
-    recentActivity: activities.slice(0, 5).map(activity => { const item = activity.relatedContentId ? content.find(item => item.id === activity.relatedContentId) : undefined; return item ? { ...activity, detail: `${item.title} · ${channels.find(channel => channel.id === item.channelId)?.name ?? 'Unassigned'}` } : activity }),
+    recentActivity: activityRows.slice(0, 5),
+    activityHistory: activityRows,
     pipelineStages: [
       { name: 'Ideas', jobs: content.filter((item) => item.status === 'Idea').length, color: 'purple' },
       { name: 'Scripting', jobs: content.filter((item) => item.status === 'Script').length, color: 'blue' },

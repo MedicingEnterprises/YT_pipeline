@@ -1,0 +1,475 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ChannelStatus {
+  CONNECTED
+  DISCONNECTED
+}
+
+enum ProviderCategory {
+  TEXT_GENERATION
+  TEXT_TO_SPEECH
+  IMAGE_GENERATION
+  VIDEO_GENERATION
+  EMBEDDINGS_ANALYSIS
+}
+
+enum ContentStatus {
+  IDEA
+  SCRIPT
+  GENERATING
+  EDITING
+  READY
+  SCHEDULED
+  PUBLISHED
+  FAILED
+}
+
+enum ContentFormat {
+  LONG_FORM
+  SHORT
+  EXPLAINER
+  INTERVIEW
+}
+
+enum Visibility {
+  PUBLIC
+  PRIVATE
+  UNLISTED
+}
+
+enum PublishPreference {
+  DECIDE_LATER
+  MANUAL
+  SCHEDULE
+}
+
+enum StepKind {
+  IDEA
+  RESEARCH
+  SCRIPT
+  VOICE
+  VISUALS
+  EDIT
+  CAPTIONS
+  THUMBNAIL
+  QUALITY_CHECK
+  REVIEW
+  UPLOAD
+  SCHEDULE
+}
+
+enum ScheduleStatus {
+  SCHEDULED
+  READY
+  PROCESSING
+  NEEDS_ATTENTION
+}
+
+enum ExecutionMode {
+  PIPELINE
+  PUBLICATION
+}
+
+enum JobStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum JobType {
+  PIPELINE_EXECUTION
+  SCHEDULED_PUBLICATION
+  RETRY
+}
+
+enum JobKind {
+  IDEA_GENERATION
+  SCRIPT_GENERATION
+  VOICE_GENERATION
+  VISUAL_GENERATION
+  VIDEO_EDITING
+  CAPTION_GENERATION
+  THUMBNAIL_GENERATION
+  QUALITY_CHECK
+  UPLOAD
+  SCHEDULING
+}
+
+enum ActivityCategory {
+  UPLOAD
+  GENERATION
+  SCHEDULING
+  WARNING
+  FAILURE
+  SUCCESS
+}
+
+enum Appearance {
+  LIGHT
+  DARK
+  SYSTEM
+}
+
+enum WeeklyDigest {
+  NEVER
+  MONDAY
+  FRIDAY
+}
+
+model User {
+  id           String            @id @default(uuid()) @db.Uuid
+  email        String            @unique @db.VarChar(320)
+  displayName  String            @db.VarChar(120)
+  createdAt    DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime          @updatedAt @db.Timestamptz(3)
+  // Null for legacy/demo accounts: these cannot authenticate with a password.
+  passwordHash String?
+  sessions     Session[]
+  imports      WorkspaceImport[]
+  channels     Channel[]
+  providers    AIProvider[]
+  pipelines    Pipeline[]
+  steps        PipelineStep[]
+  assignments  PipelineChannel[]
+  content      ContentItem[]
+  schedules    Schedule[]
+  jobs         Job[]
+  jobEvents    JobEvent[]
+  activities   Activity[]
+  analytics    AnalyticsRecord[]
+  preferences  UserPreferences?
+}
+
+model WorkspaceImport {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+  digest String @db.Char(64)
+  counts Json
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([userId, digest])
+}
+
+model Session {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @db.Uuid
+  tokenHash     String   @unique @db.Char(64)
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  lastSeenAt    DateTime @default(now()) @db.Timestamptz(3)
+  expiresAt     DateTime @db.Timestamptz(3)
+  idleExpiresAt DateTime @db.Timestamptz(3)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([idleExpiresAt])
+}
+
+model Channel {
+  id                String            @id @default(uuid()) @db.Uuid
+  userId            String            @db.Uuid
+  name              String            @db.VarChar(160)
+  handle            String            @db.VarChar(100)
+  category          String            @default("")
+  color             String            @default("channel-purple")
+  status            ChannelStatus     @default(DISCONNECTED)
+  subscriberCount   BigInt            @default(0)
+  scheduleDays      String            @default("")
+  scheduleTime      String            @default("09:00") @db.VarChar(5)
+  defaultPipelineId String?           @db.Uuid
+  createdAt         DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime          @updatedAt @db.Timestamptz(3)
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  defaultPipeline   Pipeline?         @relation("ChannelDefault", fields: [userId, defaultPipelineId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  assignments       PipelineChannel[]
+  content           ContentItem[]
+  activities        Activity[]
+  preferredBy       UserPreferences[] @relation("PreferredChannel")
+
+  @@unique([userId, id])
+  @@unique([userId, handle])
+  @@index([userId, status])
+  @@index([userId, defaultPipelineId])
+}
+
+model AIProvider {
+  id               String            @id @default(uuid()) @db.Uuid
+  userId           String            @db.Uuid
+  name             String            @db.VarChar(160)
+  category         ProviderCategory
+  connected        Boolean           @default(false)
+  enabled          Boolean           @default(true)
+  models           String[]          @default([])
+  lastUsedAt       DateTime?         @db.Timestamptz(3)
+  createdAt        DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime          @updatedAt @db.Timestamptz(3)
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  steps            PipelineStep[]
+  jobs             Job[]
+  activities       Activity[]
+  textPreferences  UserPreferences[] @relation("TextProvider")
+  voicePreferences UserPreferences[] @relation("VoiceProvider")
+  imagePreferences UserPreferences[] @relation("ImageProvider")
+
+  @@unique([userId, id])
+  @@index([userId, category, enabled])
+}
+
+model Pipeline {
+  id              String            @id @default(uuid()) @db.Uuid
+  userId          String            @db.Uuid
+  name            String            @db.VarChar(160)
+  description     String            @default("")
+  enabled         Boolean           @default(true)
+  lastUsedAt      DateTime?         @db.Timestamptz(3)
+  createdAt       DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @db.Timestamptz(3)
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  steps           PipelineStep[]
+  assignments     PipelineChannel[]
+  defaultChannels Channel[]         @relation("ChannelDefault")
+  content         ContentItem[]
+  jobs            Job[]
+  activities      Activity[]
+  preferredBy     UserPreferences[] @relation("PreferredPipeline")
+
+  @@unique([userId, id])
+  @@index([userId, enabled])
+}
+
+model PipelineChannel {
+  userId     String   @db.Uuid
+  pipelineId String   @db.Uuid
+  channelId  String   @db.Uuid
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pipeline   Pipeline @relation(fields: [userId, pipelineId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+  channel    Channel  @relation(fields: [userId, channelId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([userId, pipelineId, channelId])
+  @@index([userId, channelId])
+}
+
+model PipelineStep {
+  id           String      @id @default(uuid()) @db.Uuid
+  userId       String      @db.Uuid
+  pipelineId   String      @db.Uuid
+  providerId   String?     @db.Uuid
+  kind         StepKind
+  enabled      Boolean     @default(true)
+  order        Int
+  instructions String      @default("")
+  durationMs   Int         @default(1000)
+  createdAt    DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime    @updatedAt @db.Timestamptz(3)
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pipeline     Pipeline    @relation(fields: [userId, pipelineId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+  provider     AIProvider? @relation(fields: [userId, providerId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  jobs         Job[]
+
+  @@unique([userId, id])
+  @@unique([userId, pipelineId, order])
+  @@unique([userId, pipelineId, id])
+  @@index([userId, providerId])
+}
+
+model ContentItem {
+  id                String            @id @default(uuid()) @db.Uuid
+  userId            String            @db.Uuid
+  channelId         String            @db.Uuid
+  pipelineId        String?           @db.Uuid
+  title             String            @db.VarChar(300)
+  status            ContentStatus     @default(IDEA)
+  format            ContentFormat     @default(LONG_FORM)
+  visibility        Visibility        @default(PRIVATE)
+  publishPreference PublishPreference @default(DECIDE_LATER)
+  notes             String            @default("")
+  thumbnail         String            @default("")
+  publishedAt       DateTime?         @db.Timestamptz(3)
+  createdAt         DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime          @updatedAt @db.Timestamptz(3)
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel           Channel           @relation(fields: [userId, channelId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  pipeline          Pipeline?         @relation(fields: [userId, pipelineId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  schedule          Schedule?
+  jobs              Job[]
+  activities        Activity[]
+  analytics         AnalyticsRecord[]
+
+  @@unique([userId, id])
+  @@index([userId, status, createdAt])
+  @@index([userId, channelId, status])
+  @@index([userId, pipelineId])
+}
+
+model Schedule {
+  id            String         @id @default(uuid()) @db.Uuid
+  userId        String         @db.Uuid
+  contentId     String         @db.Uuid
+  scheduledAt   DateTime       @db.Timestamptz(3)
+  timezone      String         @default("UTC") @db.VarChar(100)
+  status        ScheduleStatus @default(SCHEDULED)
+  executionMode ExecutionMode  @default(PUBLICATION)
+  createdAt     DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime       @updatedAt @db.Timestamptz(3)
+  // Derive channel, pipeline and title from content instead of duplicating them.
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content       ContentItem    @relation(fields: [userId, contentId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+  jobs          Job[]
+
+  @@unique([userId, id])
+  @@unique([userId, contentId])
+  @@unique([userId, contentId, id])
+  @@index([status, scheduledAt])
+  @@index([userId, scheduledAt])
+}
+
+model Job {
+  id             String        @id @default(uuid()) @db.Uuid
+  userId         String        @db.Uuid
+  contentId      String        @db.Uuid
+  pipelineId     String?       @db.Uuid
+  pipelineStepId String?       @db.Uuid
+  providerId     String?       @db.Uuid
+  scheduleId     String?       @db.Uuid
+  type           JobType       @default(PIPELINE_EXECUTION)
+  kind           JobKind
+  status         JobStatus     @default(QUEUED)
+  mode           ExecutionMode @default(PIPELINE)
+  paused         Boolean       @default(false)
+  claimed        Boolean       @default(false)
+  attempt        Int           @default(1)
+  progress       Int           @default(0)
+  idempotencyKey String?       @db.VarChar(300)
+  scheduledAt    DateTime?     @db.Timestamptz(3)
+  startedAt      DateTime?     @db.Timestamptz(3)
+  completedAt    DateTime?     @db.Timestamptz(3)
+  errorMessage   String?
+  metadata       Json          @default("{}")
+  // Versioned execution snapshot/checkpoint; relational status is authoritative.
+  execution      Json?
+  createdAt      DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @db.Timestamptz(3)
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content        ContentItem   @relation(fields: [userId, contentId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+  pipeline       Pipeline?     @relation(fields: [userId, pipelineId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  step           PipelineStep? @relation(fields: [userId, pipelineId, pipelineStepId], references: [userId, pipelineId, id], onDelete: Restrict, onUpdate: NoAction)
+  provider       AIProvider?   @relation(fields: [userId, providerId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  schedule       Schedule?     @relation(fields: [userId, contentId, scheduleId], references: [userId, contentId, id], onDelete: Restrict, onUpdate: NoAction)
+  events         JobEvent[]
+  activities     Activity[]
+
+  @@unique([userId, id])
+  @@unique([userId, idempotencyKey])
+  @@index([status, scheduledAt])
+  @@index([userId, contentId, createdAt])
+  @@index([userId, pipelineId, pipelineStepId])
+  @@index([userId, providerId])
+  @@index([userId, contentId, scheduleId])
+}
+
+model JobEvent {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  jobId     String    @db.Uuid
+  status    JobStatus
+  attempt   Int       @default(1)
+  message   String
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job       Job       @relation(fields: [userId, jobId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId, jobId, createdAt])
+}
+
+model Activity {
+  id         String           @id @default(uuid()) @db.Uuid
+  userId     String           @db.Uuid
+  contentId  String?          @db.Uuid
+  channelId  String?          @db.Uuid
+  pipelineId String?          @db.Uuid
+  providerId String?          @db.Uuid
+  jobId      String?          @db.Uuid
+  category   ActivityCategory
+  title      String
+  detail     String           @default("")
+  icon       String           @default("Activity")
+  tone       String           @default("activity-blue")
+  createdAt  DateTime         @default(now()) @db.Timestamptz(3)
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content    ContentItem?     @relation(fields: [userId, contentId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  channel    Channel?         @relation(fields: [userId, channelId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  pipeline   Pipeline?        @relation(fields: [userId, pipelineId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  provider   AIProvider?      @relation(fields: [userId, providerId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  job        Job?             @relation(fields: [userId, jobId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([userId, createdAt])
+  @@index([userId, contentId])
+  @@index([userId, channelId])
+  @@index([userId, pipelineId])
+  @@index([userId, providerId])
+  @@index([userId, jobId])
+}
+
+model AnalyticsRecord {
+  id                     String      @id @default(uuid()) @db.Uuid
+  userId                 String      @db.Uuid
+  contentId              String      @db.Uuid
+  recordedAt             DateTime    @default(now()) @db.Timestamptz(3)
+  views                  BigInt      @default(0)
+  watchTimeHours         Decimal     @default(0) @db.Decimal(16, 4)
+  averageDurationSeconds Decimal     @default(0) @db.Decimal(12, 3)
+  engagementRate         Decimal     @default(0) @db.Decimal(7, 4)
+  subscribersGained      Int         @default(0)
+  createdAt              DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime    @updatedAt @db.Timestamptz(3)
+  user                   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content                ContentItem @relation(fields: [userId, contentId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, contentId, recordedAt])
+  @@index([userId, recordedAt])
+}
+
+model UserPreferences {
+  id                 String       @id @default(uuid()) @db.Uuid
+  userId             String       @unique @db.Uuid
+  workspaceName      String       @default("My workspace")
+  timezone           String       @default("UTC") @db.VarChar(100)
+  language           String       @default("en")
+  appearance         Appearance   @default(SYSTEM)
+  compactDensity     Boolean      @default(false)
+  reducedMotion      Boolean      @default(false)
+  notifyPipeline     Boolean      @default(true)
+  notifyPublishing   Boolean      @default(true)
+  notifyWarnings     Boolean      @default(true)
+  weeklyDigest       WeeklyDigest @default(NEVER)
+  defaultChannelId   String?      @db.Uuid
+  defaultPipelineId  String?      @db.Uuid
+  textProviderId     String?      @db.Uuid
+  voiceProviderId    String?      @db.Uuid
+  imageProviderId    String?      @db.Uuid
+  defaultVisibility  Visibility   @default(PRIVATE)
+  defaultPublishTime String       @default("09:00") @db.VarChar(5)
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime     @updatedAt @db.Timestamptz(3)
+  user               User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  defaultChannel     Channel?     @relation("PreferredChannel", fields: [userId, defaultChannelId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  defaultPipeline    Pipeline?    @relation("PreferredPipeline", fields: [userId, defaultPipelineId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  textProvider       AIProvider?  @relation("TextProvider", fields: [userId, textProviderId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  voiceProvider      AIProvider?  @relation("VoiceProvider", fields: [userId, voiceProviderId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+  imageProvider      AIProvider?  @relation("ImageProvider", fields: [userId, imageProviderId], references: [userId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([userId, defaultChannelId])
+  @@index([userId, defaultPipelineId])
+  @@index([userId, textProviderId])
+  @@index([userId, voiceProviderId])
+  @@index([userId, imageProviderId])
+}

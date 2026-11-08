@@ -90,6 +90,7 @@ export type PublishPreference =
   | 'Schedule for a date'
 
 export interface ContentItem {
+  publishedAt?: string | null
   visibility?: 'public' | 'private' | 'unlisted'
   id: string
   title: string
@@ -159,6 +160,7 @@ export type ScheduleStatus =
   | 'Needs attention'
 
 export interface ScheduledVideo {
+  executionMode?: 'pipeline' | 'publication'
   id: string
   contentId: string
   title: string
@@ -195,6 +197,7 @@ export type JobKind =
   | 'scheduling'
 
 export interface Job {
+  paused?: boolean
   id: string
   contentId: string
   pipelineStepId: string
@@ -207,6 +210,51 @@ export interface Job {
   metadata: Record<string, unknown>
   createdAt: string
   updatedAt: string
+  execution?: PipelineExecution
+  queue?: QueueJob
+}
+
+export interface QueueJob {
+  timezone: string
+  type: 'PIPELINE_EXECUTION' | 'SCHEDULED_PUBLICATION' | 'RETRY'
+  mode: 'pipeline' | 'publication'
+  scheduleId: string | null
+  scheduleKey: string | null
+  scheduledAt: string | null
+  pipelineId: string
+  claimed: boolean
+  attempt: number
+  history: { status: JobStatus; at: string; message: string; attempt: number }[]
+}
+
+export type ExecutionStatus = 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+
+export interface ExecutionStep {
+  id: string
+  kind: PipelineStepKind
+  providerId: string | null
+  instructions: string
+  durationMs: number
+}
+
+/** Durable worker checkpoint. Timers and React state are deliberately excluded. */
+export interface PipelineExecution {
+  reviewBeforePublishing?: boolean
+  publishOnComplete?: boolean
+  pipelineId: string
+  status: ExecutionStatus
+  paused: boolean
+  steps: ExecutionStep[]
+  currentStepId: string | null
+  completedStepIds: string[]
+  failedStepId: string | null
+  progress: number
+  stepStartedAt: string | null
+  remainingMs: number
+  checkpointStatus: ContentStatus
+  failureStepId: string | null
+  scheduledAt: string
+  eventSequence: number
 }
 
 // ============================================================================
@@ -280,6 +328,9 @@ export type ActivityTone =
   | 'activity-red'
 
 export interface Activity {
+  relatedChannelId?: string | null
+  relatedPipelineId?: string | null
+  relatedProviderId?: string | null
   id: string
   category: ActivityCategory
   title: string

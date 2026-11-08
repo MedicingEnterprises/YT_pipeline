@@ -2,6 +2,9 @@
 import type { AppState } from './store'
 import { saveContent, saveSchedule, removeContent, removeSchedule, removePipeline, removeProvider, removeChannel } from './mutations.ts'
 import { validateChannel, validateContent, validatePipeline, validatePreferences, validateProvider, validateSchedule, validationError, operationFailure, type OperationResult, type FieldErrors } from './validation.ts'
+import { executionOperationError } from '../execution/engine.ts'
+import { queueOperationError } from '../execution/queue.ts'
+import { recordWorkspaceActivity } from './activity.ts'
 
 export type EntityKind = 'channel' | 'provider' | 'content' | 'pipeline' | 'schedule'
 export type EntityTypes = { channel: Channel; provider: AIProvider; content: ContentItem; pipeline: Pipeline; schedule: ScheduledVideo }
@@ -11,10 +14,12 @@ export const collectionKeys = { channel: 'channels', provider: 'providers', cont
 
 export function executeOperation(state: AppState, operation: Operation, instant = new Date()): { state: AppState; result: OperationResult } {
   try {
+    const executionError = executionOperationError(state, operation) ?? queueOperationError(state, operation)
+    if (executionError) return { state, result: validationError({ execution: executionError }) }
     if (operation.type === 'preferences') {
       const errors = validatePreferences(operation.value, state)
       if (Object.keys(errors).length) return { state, result: validationError(errors) }
-      return { state: { ...state, preferences: { ...operation.value, workspaceName: operation.value.workspaceName.trim(), updatedAt: instant.toISOString() } }, result: { ok: true, message: 'Preferences saved across your workspace.' } }
+      return { state: recordWorkspaceActivity({ ...state, preferences: { ...operation.value, workspaceName: operation.value.workspaceName.trim(), updatedAt: instant.toISOString() } }, { title: 'Workspace preferences updated', detail: operation.value.workspaceName.trim() }, instant), result: { ok: true, message: 'Preferences saved across your workspace.' } }
     }
     const collection = state[collectionKeys[operation.kind]]
     const id = operation.type === 'save' ? operation.value.id : operation.id
@@ -24,7 +29,9 @@ export function executeOperation(state: AppState, operation: Operation, instant 
       if (!collection.has(id)) return { state, result: { ok: false, kind: 'failure', message: 'This item is no longer available. Close the dialog and refresh the list.', errors: {} } }
       if (operation.kind === 'channel' && Array.from(state.content.values()).some(item => item.channelId === id)) return reject({ channel: 'Reassign or delete this channel’s content before deleting the channel.' })
       const remove = { channel: removeChannel, provider: removeProvider, content: removeContent, pipeline: removePipeline, schedule: removeSchedule }[operation.kind]
-      return { state: remove(state, id), result: { ok: true, message: `${operation.kind === 'schedule' ? 'Schedule' : operation.kind[0].toUpperCase() + operation.kind.slice(1)} deleted.` } }
+      const previous = collection.get(id)!
+      const detail = 'name' in previous ? previous.name : previous.title
+      return { state: recordWorkspaceActivity(remove(state, id), { title: `${operation.kind} deleted`, detail, ...('channelId' in previous ? { relatedChannelId: previous.channelId } : {}), ...(operation.kind === 'channel' ? { relatedChannelId: id } : operation.kind === 'provider' ? { relatedProviderId: id } : operation.kind === 'pipeline' ? { relatedPipelineId: id } : {}) }, instant), result: { ok: true, message: `${operation.kind === 'schedule' ? 'Schedule' : operation.kind[0].toUpperCase() + operation.kind.slice(1)} deleted.` } }
     }
     if (operation.targetId && operation.targetId !== id) return reject({ id: 'An existing item cannot be replaced with a different item. Close and reopen the form.' })
     if (operation.mode === 'create' && collection.has(id)) return reject({ id: 'This item already exists. Close the form and add a new item.' })
@@ -64,6 +71,7 @@ export function executeOperation(state: AppState, operation: Operation, instant 
       case 'content': next = saveContent(state, { ...operation.value, title: operation.value.title.trim() }); break
       case 'schedule': next = saveSchedule(state, operation.value); break
     }
+    if (operation.kind === 'channel' || operation.kind === 'provider' || operation.kind === 'pipeline') next = recordWorkspaceActivity(next, { title: `${operation.kind} ${operation.mode === 'create' ? 'created' : 'updated'}`, detail: operation.value.name.trim(), ...(operation.kind === 'channel' ? { relatedChannelId: id } : operation.kind === 'provider' ? { relatedProviderId: id } : { relatedPipelineId: id }) }, instant)
     return { state: next, result: { ok: true, message: `${operation.kind === 'schedule' ? 'Schedule' : operation.kind[0].toUpperCase() + operation.kind.slice(1)} ${operation.mode === 'create' ? 'created' : 'updated'}.` } }
   } catch {
     // Never reveal thrown messages or stack traces to a user, or commit partially changed state.

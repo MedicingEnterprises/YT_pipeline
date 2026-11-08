@@ -11,7 +11,7 @@ export function useSubmission() {
   const mounted = useRef(true)
   const prefix = useId()
   useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
-  const submit = async (work: () => OperationResult): Promise<OperationResult> => {
+  const submit = async (work: () => OperationResult | Promise<OperationResult>): Promise<OperationResult> => {
     if (locked.current) return { ok: false, kind: 'failure', message: 'This change is already being saved. Please wait.', errors: {} }
     locked.current = true
     setPending(true); setResult(null)
@@ -19,7 +19,7 @@ export function useSubmission() {
     await new Promise<void>(resolve => window.setTimeout(resolve, 0))
     if (!mounted.current) { locked.current = false; return operationFailure() }
     let outcome: OperationResult
-    try { outcome = work() } catch { outcome = operationFailure() }
+    try { outcome = await work() } catch { outcome = operationFailure() }
     if (mounted.current) { setResult(outcome); setPending(false) }
     locked.current = false
     return outcome
@@ -47,14 +47,15 @@ export function OperationFeedback({ result, pending = false, pendingLabel = 'Sav
   </div>
 }
 
-export function useDialog(onClose: () => void, busy: boolean) {
+export function useDialog(onClose: () => void, busy: boolean, enabled = true) {
   const ref = useRef<HTMLElement>(null)
   const latest = useRef({ onClose, busy })
   useEffect(() => { latest.current = { onClose, busy } }, [onClose, busy])
   useEffect(() => {
+    if (!enabled) return
     const previous = document.activeElement as HTMLElement | null
-    const controls = () => Array.from(ref.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]') ?? [])
-    const initialControl = ref.current?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), textarea:not(:disabled)') ?? controls()[0]
+    const controls = () => Array.from(ref.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex]:not([tabindex="-1"])') ?? []).filter(element => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== 'hidden' && !element.closest('[hidden], [inert], fieldset[disabled]'))
+    const initialControl = controls().find(element => ['INPUT', 'SELECT', 'TEXTAREA'].includes(element.tagName)) ?? controls()[0]
     initialControl?.focus()
     const keydown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.stopImmediatePropagation(); if (!latest.current.busy) latest.current.onClose() }
@@ -67,7 +68,7 @@ export function useDialog(onClose: () => void, busy: boolean) {
     }
     document.addEventListener('keydown', keydown, true)
     return () => { document.removeEventListener('keydown', keydown, true); if (previous?.isConnected) previous.focus() }
-  }, [])
+  }, [enabled])
   return ref
 }
 
@@ -91,8 +92,21 @@ function DeleteDialog() {
   </section></div>
 }
 export function WorkspaceFeedback() {
-  const { notice, actions, pendingDelete } = useStore()
-  return <><OperationFeedback result={notice} onDismiss={actions.dismissNotice} />{pendingDelete && <DeleteDialog key={`${pendingDelete.kind}-${pendingDelete.id}`} />}</>
+  const { notice, actions, pendingDelete, pendingReset, persistenceStatus, saving, syncError } = useStore()
+  const storageError = persistenceStatus?.message
+  return <>{syncError && <div className="operation-feedback operation-error" role="alert"><CircleAlert size={17} /><div><strong>{syncError}</strong></div><Button onClick={actions.retryPersistence}>Refresh workspace</Button></div>}{storageError && <div className="operation-feedback operation-error" role="alert"><CircleAlert size={17} /><div><strong>{storageError}</strong></div>{['write-error', 'unavailable'].includes(persistenceStatus.kind) && <Button variant="secondary" onClick={actions.retryPersistence}>Retry saving</Button>}</div>}<OperationFeedback result={notice} pending={saving} onDismiss={actions.dismissNotice} />{pendingDelete && <DeleteDialog key={`${pendingDelete.kind}-${pendingDelete.id}`} />}{pendingReset && <ResetWorkspaceDialog />}</>
+}
+
+export function ResetWorkspaceDialog() {
+  const { actions, remote } = useStore()
+  const submission = useSubmission()
+  const ref = useDialog(actions.cancelReset, submission.pending)
+  return <div className="modal-backdrop"><section ref={ref} className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="reset-title" aria-describedby="reset-description" tabIndex={-1}>
+    <h2 id="reset-title">Reset this workspace?</h2>
+    <p id="reset-description" className="dialog-description">{remote ? 'This permanently deletes your account’s server workspace records and resets preferences. Your account, session, import receipts and original browser backup are kept. Other users are unaffected. This cannot be undone.' : 'This permanently replaces the saved workspace in this browser with an empty workspace and default preferences. Channels, providers, content, pipelines, schedules, jobs, activity, and analytics will be removed. Demo data will not be added again. This cannot be undone.'}</p>
+    <OperationFeedback result={submission.result} pending={submission.pending} pendingLabel="Resetting workspace…" />
+    <div className="dialog-footer"><Button onClick={actions.cancelReset} disabled={submission.pending}>Keep workspace</Button><Button variant="primary" className="button-danger" disabled={submission.pending} onClick={() => { void submission.submit(actions.resetState) }}>Reset workspace permanently</Button></div>
+  </section></div>
 }
 
 export class WorkspaceErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {

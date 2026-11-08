@@ -1,5 +1,6 @@
 import type { ContentItem, ScheduledVideo, ContentStatus, ScheduleStatus } from '../models'
 import type { AppState } from './store'
+import { suggestedScheduleMode } from './selectors.ts'
 
 const now = () => new Date().toISOString()
 const contentStatus: Record<ScheduleStatus, ContentStatus> = { Scheduled: 'Scheduled', Ready: 'Ready', Processing: 'Generating', 'Needs attention': 'Failed' }
@@ -20,7 +21,7 @@ export function saveContent(state: AppState, item: ContentItem): AppState {
   const related = Array.from(scheduledVideos.values()).find(schedule => schedule.contentId === item.id)
   if (item.scheduledAt && item.status !== 'Published') {
     const schedule: ScheduledVideo = { id: related?.id ?? `schedule-${item.id}`, contentId: item.id, title: item.title, thumbnail: item.thumbnail, channelId: item.channelId, pipelineId: item.pipelineId, scheduledAt: item.scheduledAt, status: scheduleStatus(item.status), createdAt: related?.createdAt ?? now(), updatedAt: now() }
-    scheduledVideos.set(schedule.id, schedule)
+    scheduledVideos.set(schedule.id, { ...schedule, executionMode: related?.executionMode ?? suggestedScheduleMode(state, item.id) })
   } else {
     for (const [id, schedule] of scheduledVideos) if (schedule.contentId === item.id) scheduledVideos.delete(id)
     updated.scheduledAt = ''
@@ -50,7 +51,7 @@ export function saveSchedule(state: AppState, schedule: ScheduledVideo): AppStat
   const scheduledVideos = new Map(next.scheduledVideos)
   const item = content.get(schedule.contentId)!
   for (const [id, other] of scheduledVideos) if (other.contentId === item.id && id !== schedule.id) scheduledVideos.delete(id)
-  scheduledVideos.set(schedule.id, { ...schedule, title: item.title, channelId: item.channelId, pipelineId: item.pipelineId, thumbnail: item.thumbnail, updatedAt: now() })
+  scheduledVideos.set(schedule.id, { ...schedule, executionMode: schedule.executionMode ?? suggestedScheduleMode(state, item.id), title: item.title, channelId: item.channelId, pipelineId: item.pipelineId, thumbnail: item.thumbnail, updatedAt: now() })
   content.set(item.id, { ...item, scheduledAt: schedule.scheduledAt, status: contentStatus[schedule.status], publishPreference: 'Schedule for a date', updatedAt: now() })
   return recordActivity({ ...next, content, scheduledVideos }, content.get(item.id)!, 'Mock schedule updated')
 }

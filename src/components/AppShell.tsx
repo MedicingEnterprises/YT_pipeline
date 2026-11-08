@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { NavLink, useLocation } from 'react-router-dom'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import {
   BarChart3,
   Bell,
@@ -21,7 +21,10 @@ import {
 import { Avatar, Button } from './ui'
 import { useStore } from '../state/store'
 import { ChannelEditor, ContentEditor } from './EntityEditors'
-import { WorkspaceFeedback, WorkspaceErrorBoundary } from './feedback'
+import { WorkspaceFeedback, WorkspaceErrorBoundary, useDialog } from './feedback'
+import { workspaceCounts } from '../state/selectors'
+import { useOptionalAuth } from '../auth/AuthProvider'
+import { WorkspaceImport } from './WorkspaceImport'
 
 const primaryLinks = [
   { label: 'Dashboard', to: '/', icon: LayoutDashboard },
@@ -94,10 +97,15 @@ function Sidebar({
   onClose: () => void
 }) {
   const { state } = useStore()
+  const [isMobile, setIsMobile] = useState(false)
+  const auth = useOptionalAuth()
+  const [accountError, setAccountError] = useState('')
+  useEffect(() => { const media = window.matchMedia('(max-width: 920px)'); const update = () => setIsMobile(media.matches); update(); media.addEventListener('change', update); return () => media.removeEventListener('change', update) }, [])
+  const ref = useDialog(onClose, false, isMobile && open)
   return (
     <>
       {open && <button className="sidebar-overlay" onClick={onClose} aria-label="Close menu" />}
-      <aside className={`sidebar${open ? ' sidebar-open' : ''}`}>
+      <aside id="workspace-sidebar" ref={ref} className={`sidebar${open ? ' sidebar-open' : ''}`} inert={isMobile && !open} role={isMobile && open ? 'dialog' : undefined} aria-modal={isMobile && open ? true : undefined} aria-label={isMobile && open ? 'Workspace navigation' : undefined}>
         <div className="brand">
           <NavLink to="/" className="brand-link" onClick={onClose}>
             <span className="brand-mark">
@@ -112,7 +120,7 @@ function Sidebar({
           </button>
         </div>
 
-        <button className="workspace-switcher">
+        <button className="workspace-switcher" disabled title="One local workspace. Workspace switching is unavailable in this prototype.">
           <span className="workspace-avatar">N</span>
           <span className="workspace-details">
             <span className="workspace-caption">Workspace</span>
@@ -142,9 +150,9 @@ function Sidebar({
             <span>Settings</span>
           </NavLink>
           <div className="user-profile">
-            <Avatar initials="JD" />
-            <span className="user-details"><strong>Jordan Davis</strong><small>Creator plan</small></span>
-            <button className="profile-more" aria-label="Profile options"><MoreIcon /></button>
+            <Avatar initials={auth?.user?.displayName.slice(0, 2).toUpperCase() ?? 'JD'} />
+            <span className="user-details"><strong>{auth?.user?.displayName ?? 'Jordan Davis'}</strong><small>{auth?.user?.email ?? 'Creator plan'}</small>{accountError && <small role="alert">{accountError}</small>}</span>
+            <button className="profile-more" aria-label={auth ? 'Sign out' : 'Profile options unavailable'} disabled={!auth} title={auth ? 'Sign out' : 'Account unavailable'} onClick={() => void auth?.logout().catch(error => setAccountError(error.message))}><MoreIcon /></button>
           </div>
         </div>
       </aside>
@@ -167,22 +175,30 @@ export function AppShell({
   onOpenDialog: () => void
   onCloseDialog: () => void
 }) {
-  const { state } = useStore()
+  const { state, persistenceStatus, remote, reload } = useStore()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
+  const helpRef = useDialog(() => setHelpOpen(false), false, helpOpen)
   const location = useLocation()
+  const navigate = useNavigate()
   const title = pageTitles[location.pathname] ?? 'Dashboard'
   const searchRef = useRef<HTMLInputElement>(null)
+  const openContentSearch = useCallback(() => { const input = document.querySelector<HTMLInputElement>('[aria-label="Search content"]'); if (input?.getClientRects().length) input.focus(); else navigate('/content?focus=search') }, [navigate])
+  const counts = workspaceCounts(state)
+  const footerStatus = persistenceStatus && !['saved', 'first-run'].includes(persistenceStatus.kind) ? 'Workspace not saved' : counts.failed ? `${counts.failed} jobs need attention` : counts.processing ? `${counts.processing} mock jobs running` : 'Mock workspace ready'
 
   useEffect(() => {
     const focusSearch = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        if (document.querySelector('[aria-modal="true"]')) return
         event.preventDefault()
-        searchRef.current?.focus()
+        if (searchRef.current?.getClientRects().length) searchRef.current.focus()
+        else openContentSearch()
       }
     }
     window.addEventListener('keydown', focusSearch)
     return () => window.removeEventListener('keydown', focusSearch)
-  }, [])
+  }, [openContentSearch])
 
 
   useEffect(() => {
@@ -205,37 +221,41 @@ export function AppShell({
               iconOnly
               icon={<Menu size={20} />}
               aria-label="Open navigation"
+              aria-expanded={mobileMenuOpen}
+              aria-controls="workspace-sidebar"
               onClick={() => setMobileMenuOpen(true)}
             />
             <div className="breadcrumbs"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{title}</strong></div>
           </div>
           <div className="topbar-actions">
             <label className="search-box">
-              <Search size={17} />
-              <input ref={searchRef} aria-label="Search" placeholder="Search anything..." />
+              <button type="button" className="search-trigger" aria-label="Open content search" onClick={openContentSearch}><Search size={17} /></button>
+              <input ref={searchRef} aria-label="Search content workspace" placeholder="Search content..." onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); navigate(`/content?search=${encodeURIComponent(event.currentTarget.value.trim())}`) } }} />
               <kbd>Ctrl K</kbd>
             </label>
             <Button
               variant="ghost"
               iconOnly
-              icon={<span className="notification-icon"><Bell size={18} /><span className="notification-dot" /></span>}
+              icon={<span className="notification-icon"><Bell size={18} />{state.activities.length > 0 && <span className="notification-dot" />}</span>}
               aria-label="Notifications"
               className="notification-button"
+              onClick={() => navigate('/?activity=all#activity-history')}
             >
             </Button>
             <span className="topbar-divider" />
-            <button className="help-link"><CircleHelp size={17} /><span>Help</span></button>
+            <button className="help-link" onClick={() => setHelpOpen(true)}><CircleHelp size={17} /><span>Help</span></button>
             <Button variant="primary" className="topbar-create" icon={<Plus size={16} />} onClick={onOpenDialog}>New video</Button>
           </div>
         </header>
-        <main className="page-content"><WorkspaceFeedback /><WorkspaceErrorBoundary key={location.pathname}>{children}</WorkspaceErrorBoundary></main>
+        <main className="page-content"><WorkspaceFeedback />{remote && reload && <WorkspaceImport onImported={reload} />}<WorkspaceErrorBoundary key={location.pathname}>{children}</WorkspaceErrorBoundary></main>
         <footer className="app-footer">
           <span><Video size={15} /> Content Hub <span className="footer-divider">·</span> Creator workspace</span>
-          <span className="footer-status"><span /> All systems ready</span>
+          <span className="footer-status"><span />{footerStatus}</span>
         </footer>
       </div>
-      {dialogKind === 'video' && <ContentEditor onClose={onCloseDialog} />}
+      {dialogKind === 'video' && <ContentEditor onClose={onCloseDialog} onSaved={id => navigate(`/content?content=${encodeURIComponent(id)}`)} />}
       {dialogKind === 'channel' && <ChannelEditor onClose={onCloseDialog} />}
+      {helpOpen && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setHelpOpen(false) }}><section ref={helpRef} className="dialog" tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="workspace-help-title"><div className="dialog-header"><h2 id="workspace-help-title">Mock workspace help</h2><Button onClick={() => setHelpOpen(false)}>Close help</Button></div><ol><li>Create and mock-connect a channel.</li><li>Configure mock providers and assign compatible providers to pipeline steps.</li><li>Create an idea, choose its channel and pipeline, and run preparation from Content Details.</li><li>Pause, resume, or retry as needed. Review Ready content, then schedule a future publication.</li><li>Keep the app open for the mock queue to publish. Open Notifications to review activity history.</li></ol><p>Workspace changes are local to this browser. No AI generation, uploads, authentication, or closed-browser background work occurs.</p></section></div>}
     </div>
   )
 }

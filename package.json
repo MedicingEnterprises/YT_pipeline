@@ -8,8 +8,9 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "node --test tests/state.test.mjs tests/validation.test.mjs && node tests/render.mjs",
-    "typecheck": "tsc -b"
+    "test": "node --test tests/state.test.mjs tests/validation.test.mjs tests/persistence.test.mjs tests/execution.test.mjs tests/queue.test.mjs tests/workflow.test.mjs && node tests/render.mjs",
+    "typecheck": "tsc -b",
+    "test:browser": "node tests/browser.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.48.0",

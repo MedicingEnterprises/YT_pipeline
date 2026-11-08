@@ -1,19 +1,18 @@
 ﻿import type { AIProvider, Channel, ContentItem, ContentStatus, Pipeline, PipelineStepKind, ProviderCategory, ScheduledVideo, UserPreferences } from '../models'
 import type { AppState } from './store'
+import { isDateTime, isTime, wallTimeNow } from './time.ts'
+import { contentTransitions, supportedProviderCategories, validChannelHandle } from '../../server/src/domain/workflow-rules.ts'
+export { isDateTime, isTime, wallTimeNow } from './time.ts'
 
 export type FieldErrors = Record<string, string>
-export type OperationResult = { ok: true; message: string } | { ok: false; kind: 'validation' | 'failure'; message: string; errors: FieldErrors }
+export type OperationResult = { ok: true; message: string; entityId?: string } | { ok: false; kind: 'validation' | 'failure'; message: string; errors: FieldErrors }
 export const validationError = (errors: FieldErrors): OperationResult => ({ ok: false, kind: 'validation', message: 'Please fix the highlighted fields and try again.', errors })
 export const operationFailure = (): OperationResult => ({ ok: false, kind: 'failure', message: 'Your changes could not be saved. Please try again. Your previous data is safe.', errors: {} })
 
 export const contentStatuses: ContentStatus[] = ['Idea', 'Script', 'Generating', 'Editing', 'Ready', 'Scheduled', 'Published', 'Failed']
 export const providerCategories: ProviderCategory[] = ['Text generation', 'Text-to-speech', 'Image generation', 'Video generation', 'Embeddings / analysis']
 export const stepKinds: PipelineStepKind[] = ['Idea', 'Script', 'Voice', 'Visuals', 'Edit', 'Captions', 'Thumbnail', 'Quality check', 'Upload', 'Schedule', 'Research', 'Review']
-export const transitions: Record<ContentStatus, ContentStatus[]> = {
-  Idea: ['Script'], Script: ['Idea', 'Generating', 'Failed'], Generating: ['Editing', 'Failed'],
-  Editing: ['Generating', 'Ready', 'Failed'], Ready: ['Editing', 'Scheduled', 'Published', 'Failed'],
-  Scheduled: ['Ready', 'Published', 'Failed'], Published: [], Failed: ['Idea', 'Script', 'Generating', 'Editing', 'Ready'],
-}
+export const transitions: Record<ContentStatus, ContentStatus[]> = contentTransitions
 export function canTransition(from: ContentStatus, to: ContentStatus): boolean {
   return contentStatuses.includes(from) && contentStatuses.includes(to) && (from === to || transitions[from].includes(to))
 }
@@ -34,23 +33,9 @@ function uniqueName<T extends { id: string }>(errors: FieldErrors, field: string
 function choice(errors: FieldErrors, field: string, value: unknown, choices: readonly string[], label: string) {
   if (!text(value) || !choices.includes(value)) errors[field] = `Choose a valid ${label}.`
 }
-export function isTime(value: unknown): value is string { return text(value) && /^([01]\d|2[0-3]):[0-5]\d$/.test(value) }
-// Validate every calendar component: Date alone would roll February 30 into March.
-export function isDateTime(value: unknown): value is string {
-  if (!text(value) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return false
-  const [year, month, day, hour, minute] = value.match(/\d+/g)!.map(Number)
-  if (year < 1900 || year > 9999 || month < 1 || month > 12 || hour > 23 || minute > 59) return false
-  const days = new Date(Date.UTC(year, month, 0)).getUTCDate()
-  return day >= 1 && day <= days
-}
-export function wallTimeNow(timezone: string, instant = new Date()): string {
-  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(instant)
-  const get = (type: string) => parts.find(part => part.type === type)!.value
-  return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}`
-}
 function dateError(errors: FieldErrors, value: unknown, previous: string | undefined, state: AppState, now: Date) {
   if (!isDateTime(value)) errors.scheduledAt = 'Choose a real date and a time between 00:00 and 23:59.'
-  else if (value !== previous && value <= wallTimeNow(state.preferences?.timezone ?? 'Asia/Colombo', now)) errors.scheduledAt = 'Choose a date and time in the future.'
+  else if (value !== previous && value <= wallTimeNow(state.preferences?.timezone ?? 'UTC', now)) errors.scheduledAt = 'Choose a date and time in the future.'
 }
 function links(errors: FieldErrors, channelId: unknown, pipelineId: unknown, state: AppState, requireEnabled: boolean) {
   if (!text(channelId) || !channelId) errors.channelId = 'Choose a channel for this content.'
@@ -69,7 +54,7 @@ export function validateChannel(value: Channel, state: AppState): FieldErrors {
   required(errors, 'handle', value.handle, 'Channel handle', 50)
   uniqueName(errors, 'name', value.name, value.id, state.channels.values(), item => item.name, 'channel')
   uniqueName(errors, 'handle', value.handle, value.id, state.channels.values(), item => item.handle, 'channel')
-  if (text(value.handle) && value.handle.trim() && !/^@[\p{L}\p{N}_.-]{3,30}$/u.test(value.handle.trim())) errors.handle = 'Use @ followed by 3–30 letters, numbers, dots, underscores, or hyphens.'
+  if (text(value.handle) && value.handle.trim() && !validChannelHandle(value.handle.trim())) errors.handle = 'Use @ followed by 3–30 letters, numbers, dots, underscores, or hyphens.'
   choice(errors, 'status', value.status, ['connected', 'disconnected'], 'connection status')
   choice(errors, 'color', value.color, ['channel-purple', 'channel-green', 'channel-orange', 'channel-blue'], 'channel color')
   if (!text(value.category) || value.category.length > 80) errors.category = 'Keep the category to 80 characters or fewer.'
@@ -97,13 +82,7 @@ export function validateProvider(value: AIProvider, state: AppState): FieldError
   return errors
 }
 export function providerTypesForStep(kind: PipelineStepKind): ProviderCategory[] {
-  if (kind === 'Voice') return ['Text-to-speech']
-  if (kind === 'Visuals') return ['Image generation', 'Video generation']
-  if (kind === 'Thumbnail') return ['Image generation']
-  if (kind === 'Edit') return ['Video generation']
-  if (['Research', 'Review', 'Quality check'].includes(kind)) return ['Text generation', 'Embeddings / analysis']
-  if (['Idea', 'Script', 'Captions'].includes(kind)) return ['Text generation']
-  return []
+  return supportedProviderCategories(kind) as ProviderCategory[]
 }
 export function validatePipeline(value: Pipeline, state: AppState): FieldErrors {
   const errors: FieldErrors = {}
@@ -165,6 +144,7 @@ export function validateContent(value: ContentItem, state: AppState, now = new D
 }
 export function validateSchedule(value: ScheduledVideo, state: AppState, now = new Date()): FieldErrors {
   const errors: FieldErrors = {}
+  if (value.executionMode !== undefined) choice(errors, 'executionMode', value.executionMode, ['pipeline', 'publication'], 'scheduled action')
   choice(errors, 'status', value.status, ['Scheduled', 'Ready', 'Processing', 'Needs attention'], 'schedule status')
   const item = state.content.get(value.contentId)
   if (!item) errors.contentId = 'Choose an available content item.'

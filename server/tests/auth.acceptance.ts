@@ -1,0 +1,178 @@
+import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
+import type { FastifyInstance, HTTPMethods } from 'fastify'
+import { buildApp } from '../src/app.js'
+import { loadConfig } from '../src/config/env.js'
+import { databaseFixture } from './database.fixture.js'
+import { AuthRepository } from '../src/database/auth.repository.js'
+
+const fixture = await databaseFixture()
+const { database } = fixture
+const environment = { NODE_ENV: 'test', DATABASE_URL: 'postgresql://localhost/unused', SESSION_SECRET: randomBytes(32).toString('base64url'), LOG_LEVEL: 'error' }
+const config = loadConfig(environment)
+let now = new Date()
+const app = buildApp(config, { database, now: () => now })
+const productionConfig = loadConfig({ ...environment, NODE_ENV: 'production', APP_ORIGINS: 'https://app.example.invalid', SESSION_COOKIE_SECURE: 'true' })
+const secureApp = buildApp(productionConfig, { database, now: () => now })
+const restartedApp = buildApp(config, { database, now: () => now })
+const rotatedApp = buildApp(loadConfig({ ...environment, SESSION_SECRET: randomBytes(32).toString('base64url') }), { database, now: () => now })
+let checks = 0
+class Client {
+  cookies = new Map<string, string>()
+  csrf: string | null = null
+  constructor(readonly ip: string, readonly server: FastifyInstance = app) {}
+  header() { return [...this.cookies].map(([key, value]) => `${key}=${value}`).join('; ') }
+  async call(method: HTTPMethods, url: string, payload?: object, status = 200, headers: Record<string, string> = {}) {
+    const reply = await this.server.inject({ method, url, remoteAddress: this.ip, headers: { cookie: this.header(), ...(this.csrf ? { 'x-csrf-token': this.csrf } : {}), ...headers }, ...(payload ? { payload } : {}) })
+    assert.equal(reply.statusCode, status, `${method} ${url}: ${reply.body}`)
+    for (const cookie of reply.cookies) { if (cookie.value) this.cookies.set(cookie.name, cookie.value); else this.cookies.delete(cookie.name) }
+    checks++
+    return reply
+  }
+  async token() { const reply = await this.call('GET', '/api/v1/auth/csrf'); this.csrf = reply.json().data.csrfToken; return reply }
+}
+const password = 'Disposable original password 15!'
+const newPassword = 'Disposable replacement password 16!'
+const alice = new Client('192.0.2.1'), bob = new Client('192.0.2.2')
+const email = 'alice@example.invalid'
+try {
+  assert.throws(() => loadConfig({ ...environment, SESSION_SECRET: 'short' }))
+  assert.throws(() => loadConfig({ ...environment, DEV_USER_ID: '00000000-0000-4000-8000-000000000001' }))
+  assert.throws(() => loadConfig({ ...environment, NODE_ENV: 'production', APP_ORIGINS: 'http://app.example.invalid' }))
+  assert.throws(() => loadConfig({ ...environment, NODE_ENV: 'production', APP_ORIGINS: 'https://app.example.invalid', SESSION_COOKIE_SECURE: 'false' }))
+  await alice.call('GET', '/api/v1/channels', undefined, 401)
+  await alice.call('POST', '/api/v1/auth/register', { email, password, displayName: 'Alice' }, 403)
+  await alice.token()
+  await alice.call('POST', '/api/v1/auth/register', { email, password: 'short', displayName: 'Alice' }, 400)
+  await alice.call('POST', '/api/v1/auth/register', { email, password, displayName: 'Alice', role: 'admin' }, 400)
+  const registered = await alice.call('POST', '/api/v1/auth/register', { email: 'ALICE@example.invalid', password, displayName: 'Alice' }, 201)
+  assert.ok(!/password|token|hash/i.test(registered.body))
+  assert.match(String(registered.headers['set-cookie']), /HttpOnly/)
+  assert.match(String(registered.headers['set-cookie']), /SameSite=Lax/)
+  assert.equal(registered.headers['cache-control'], 'no-store')
+  const user = registered.json().data.user
+  assert.equal(user.email, email)
+  const credential = await database.user.findUniqueOrThrow({ where: { id: user.id } })
+  assert.match(credential.passwordHash!, /^scrypt\$131072\$8\$1\$/)
+  assert.ok(!credential.passwordHash!.includes(password))
+  const rawToken = alice.cookies.get('content-hub-session')!
+  const stored = await database.session.findFirstOrThrow({ where: { userId: user.id } })
+  assert.match(stored.tokenHash, /^[0-9a-f]{64}$/)
+  assert.notEqual(stored.tokenHash, rawToken)
+  await alice.call('POST', '/api/v1/channels', { name: 'Owned', handle: '@owned' }, 403, { 'x-csrf-token': '' })
+  await alice.token()
+  const channel = (await alice.call('POST', '/api/v1/channels', { name: 'Owned', handle: '@owned' }, 201)).json().data
+  await alice.call('PATCH', '/api/v1/auth/me', { displayName: 'Alice revised' })
+  assert.equal((await alice.call('GET', '/api/v1/auth/me')).json().data.displayName, 'Alice revised')
+  await alice.call('PATCH', '/api/v1/auth/me', { role: 'admin' }, 400)
+  await alice.call('PATCH', '/api/v1/auth/me', { id: bob.ip }, 400)
+  await bob.token()
+  await bob.call('POST', '/api/v1/auth/register', { email: 'bob@example.invalid', password, displayName: 'Bob' }, 201)
+  await bob.token()
+  await bob.call('GET', `/api/v1/channels/${channel.id}`, undefined, 404)
+  await bob.call('PATCH', `/api/v1/channels/${channel.id}`, { name: 'Stolen' }, 404)
+  await bob.call('DELETE', `/api/v1/channels/${channel.id}`, undefined, 404)
+  await bob.call('POST', '/api/v1/channels', { name: 'Stolen', handle: '@stolen', userId: user.id }, 400)
+  const cors = await alice.call('OPTIONS', '/api/v1/channels', undefined, 204, { origin: 'http://localhost:5173', 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type,x-csrf-token' })
+  assert.equal(cors.headers['access-control-allow-origin'], 'http://localhost:5173')
+  assert.equal(cors.headers['access-control-allow-credentials'], 'true')
+  await alice.call('GET', '/api/v1/auth/me', undefined, 403, { origin: 'https://evil.example.invalid' })
+  await alice.call('POST', '/api/v1/channels', { name: 'Bad', handle: '@bad' }, 403, { origin: 'https://evil.example.invalid' })
+  const headers = await alice.call('GET', '/health')
+  assert.equal(headers.headers['x-content-type-options'], 'nosniff')
+  assert.ok(headers.headers['content-security-policy'])
+  const resumed = new Client('192.0.2.3', restartedApp)
+  resumed.cookies = new Map(alice.cookies)
+  assert.equal((await resumed.call('GET', '/api/v1/auth/me')).json().data.id, user.id)
+  const rotated = new Client('192.0.2.4', rotatedApp)
+  rotated.cookies = new Map(alice.cookies)
+  await rotated.call('GET', '/api/v1/auth/me', undefined, 401)
+  const unknown = new Client('192.0.2.5')
+  await unknown.token()
+  const unknownError = await unknown.call('POST', '/api/v1/auth/login', { email: 'unknown@example.invalid', password }, 401)
+  const wrongError = await unknown.call('POST', '/api/v1/auth/login', { email, password: 'incorrect password' }, 401)
+  assert.equal(unknownError.json().error.message, wrongError.json().error.message)
+  await database.user.create({ data: { email: 'legacy@example.invalid', displayName: 'Passwordless legacy sample' } })
+  const legacyError = await unknown.call('POST', '/api/v1/auth/login', { email: 'legacy@example.invalid', password }, 401)
+  assert.equal(legacyError.json().error.message, wrongError.json().error.message)
+  const duplicate = new Client('192.0.2.12')
+  await duplicate.token()
+  await duplicate.call('POST', '/api/v1/auth/register', { email, password, displayName: 'Duplicate' }, 409)
+  assert.equal(await database.user.count({ where: { email } }), 1)
+  await unknown.call('POST', '/api/v1/auth/login', { email, password: 12345 }, 400)
+  const old = alice.header(), oldProof = alice.csrf!
+  await alice.call('POST', '/api/v1/auth/logout', undefined, 204)
+  await alice.call('GET', '/api/v1/auth/me', undefined, 401, { cookie: old, 'x-csrf-token': oldProof })
+  await alice.token()
+  const signedIn = await alice.call('POST', '/api/v1/auth/login', { email, password })
+  assert.ok(!/password|token|hash/i.test(signedIn.body))
+  assert.notEqual(alice.cookies.get('content-hub-session'), rawToken)
+  await alice.token()
+  const device = new Client('192.0.2.6')
+  await device.token()
+  await device.call('POST', '/api/v1/auth/login', { email, password })
+  await device.token()
+  await alice.call('POST', '/api/v1/auth/logout-all', undefined, 204)
+  await device.call('GET', '/api/v1/auth/me', undefined, 401)
+  // Use a fresh client IP so the policy test below does not mask profile checks.
+  const profile = new Client('192.0.2.7')
+  await profile.token()
+  await profile.call('POST', '/api/v1/auth/login', { email, password })
+  await profile.token()
+  await profile.call('PATCH', '/api/v1/auth/me', { email: 'renamed@example.invalid' }, 401)
+  await profile.call('PATCH', '/api/v1/auth/me', { email: 'renamed@example.invalid', currentPassword: password })
+  await assert.rejects(new AuthRepository(database).issueSession(user.id, email, credential.passwordHash!, 'a'.repeat(64), new Date(now.getTime() + 3600000), new Date(now.getTime() + 60000), now), error => error instanceof Error && 'statusCode' in error && error.statusCode === 401, 'Stale pre-email-change verification cannot create a session')
+  await profile.call('GET', '/api/v1/auth/me', undefined, 401)
+  await profile.token()
+  await profile.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password })
+  await profile.token()
+  await profile.call('PUT', '/api/v1/auth/password', { currentPassword: 'wrong', newPassword }, 401)
+  await profile.call('PUT', '/api/v1/auth/password', { currentPassword: password, newPassword }, 204)
+  await profile.call('GET', '/api/v1/auth/me', undefined, 401)
+  await profile.token()
+  await profile.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password }, 401)
+  await profile.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password: newPassword })
+  await profile.token()
+  // Sliding idle expiry and fixed absolute expiry are checked with an injected clock.
+  now = new Date(now.getTime() + 29 * 60000)
+  await profile.call('GET', '/api/v1/auth/me')
+  now = new Date(now.getTime() + 29 * 60000)
+  await profile.call('GET', '/api/v1/auth/me')
+  now = new Date(now.getTime() + 31 * 60000)
+  await profile.call('GET', '/api/v1/auth/me', undefined, 401)
+  const expiring = new Client('192.0.2.8')
+  await expiring.token()
+  await expiring.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password: newPassword })
+  const absoluteSession = await database.session.findFirstOrThrow({ where: { userId: user.id }, orderBy: { createdAt: 'desc' } })
+  now = new Date(absoluteSession.expiresAt.getTime() + 1)
+  await database.session.update({ where: { id: absoluteSession.id }, data: { idleExpiresAt: absoluteSession.expiresAt } })
+  await expiring.call('GET', '/api/v1/auth/me', undefined, 401)
+  const secure = new Client('192.0.2.9', secureApp)
+  await secure.token()
+  const secureLogin = await secure.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password: newPassword })
+  const secureCookie = String(secureLogin.headers['set-cookie'])
+  assert.match(secureCookie, /__Host-content-hub-session=/)
+  assert.match(secureCookie, /Secure/)
+  assert.match(secureCookie, /HttpOnly/)
+  assert.ok(!/Domain=/i.test(secureCookie))
+  assert.ok(secureLogin.headers['strict-transport-security'])
+  const fixation = new Client('192.0.2.11')
+  await fixation.token()
+  await fixation.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password: newPassword })
+  await fixation.token()
+  const priorCookie = fixation.header()
+  await fixation.call('POST', '/api/v1/auth/login', { email: 'renamed@example.invalid', password: newPassword })
+  assert.equal((await app.inject({ url: '/api/v1/auth/me', headers: { cookie: priorCookie } })).statusCode, 401, 'Re-login must revoke the presented session')
+  await fixation.token()
+  await fixation.call('POST', '/api/v1/channels', { name: 'CSRF mismatch', handle: '@mismatch' }, 403, { 'x-csrf-token': bob.csrf! })
+  const limited = new Client('192.0.2.10')
+  await limited.token()
+  for (let i = 0; i < 10; i++) await limited.call('POST', '/api/v1/auth/login', { email }, 400)
+  const rate = await limited.call('POST', '/api/v1/auth/login', { email, password }, 429, { 'x-forwarded-for': '192.0.2.99' })
+  assert.equal(rate.json().error.code, 'RATE_LIMITED')
+  assert.ok(rate.headers['retry-after'])
+  console.log(`Authentication/security acceptance passed: ${checks} HTTP assertions, password/session storage, CSRF, owner isolation, restart, expiry, revocation, CORS, secure cookies and rate limits.`)
+} finally {
+  await app.close(); await secureApp.close(); await restartedApp.close(); await rotatedApp.close()
+  await fixture.close()
+}
