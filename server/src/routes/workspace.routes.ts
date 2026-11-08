@@ -1,7 +1,13 @@
 import type { FastifyPluginAsync } from 'fastify'
+import { AIController } from '../controllers/ai.controller.js'
+import { AIRequestService, type AITextRequest } from '../services/ai-request.service.js'
+import { textRequestSchema, usageQuerySchema } from '../schemas/ai.schema.js'
 import type { Data } from '../database/workspace.repository.js'
 import { WorkspaceController } from '../controllers/workspace.controller.js'
 import { WorkspaceService, type ListQuery } from '../services/workspace.service.js'
+import { ProviderConnectionController } from '../controllers/provider-connections.controller.js'
+import { ProviderConnectionService } from '../services/providers/connections.js'
+import type { ProbeOptions } from '../services/providers/http.js'
 import { sessionGuard } from '../middleware/session.js'
 import type { AuthService } from '../services/auth.service.js'
 import { bodySchema, idParams, jobActionSchema, listSchema, objectSchema, preferencesSchema, reorderSchema, resources, pipelineConfigurationSchema, type Resource } from '../schemas/resources.js'
@@ -9,11 +15,17 @@ import { importSchema } from '../schemas/import.schema.js'
 import { WorkspaceSyncController } from '../controllers/workspace-sync.controller.js'
 import { WorkspaceSyncService, type ImportData } from '../services/workspace-sync.service.js'
 
-export const workspaceRoutes: FastifyPluginAsync<{ auth: AuthService }> = async (app, options) => {
+export const workspaceRoutes: FastifyPluginAsync<{ auth: AuthService; encryptionKey?: string; providerProbe?: ProbeOptions; sensitiveValues?: readonly string[]; now?: () => Date }> = async (app, options) => {
   app.addHook('preHandler', sessionGuard(options.auth))
   app.addHook('onSend', async (_request, reply, payload) => { reply.header('Cache-Control', 'no-store'); return payload })
-  const controller = new WorkspaceController(new WorkspaceService(app.database))
-  const sync = new WorkspaceSyncController(new WorkspaceSyncService(app.database), new WorkspaceService(app.database))
+  const controller = new WorkspaceController(new WorkspaceService(app.database, options.encryptionKey))
+  const sync = new WorkspaceSyncController(new WorkspaceSyncService(app.database), new WorkspaceService(app.database, options.encryptionKey))
+  const connections = new ProviderConnectionController(new ProviderConnectionService(app.database, options.encryptionKey, options.providerProbe))
+  const ai = new AIController(new AIRequestService(app.database, options.encryptionKey, options.providerProbe, options.sensitiveValues, options.now))
+  app.post<{ Body: AITextRequest }>('/ai/text', { bodyLimit: 80000, schema: { body: textRequestSchema }, config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, request => ai.generate(request))
+  app.get<{ Querystring: { page: number; limit: number; requestId?: string } }>('/ai/usage', { schema: { querystring: usageQuerySchema } }, request => ai.usage(request))
+  app.get('/ai-provider-catalog', () => connections.catalog())
+  app.post<{ Params: { id: string } }>('/ai-providers/:id/test-connection', { schema: { params: idParams }, config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, request => connections.test(request))
   app.get('/workspace', request => sync.snapshot(request))
   app.post('/workspace/reset', { schema: { body: objectSchema({ confirmation: { const: 'RESET', type: 'string' } }, ['confirmation']) } }, request => sync.reset(request))
   app.post<{ Body: ImportData }>('/workspace/import/preview', { bodyLimit: 5 * 1024 * 1024, schema: { body: importSchema } }, request => sync.preview(request))

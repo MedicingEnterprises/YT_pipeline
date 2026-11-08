@@ -4,6 +4,7 @@ export interface ServerConfig {
   port: number
   logLevel: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent'
   databaseUrl: string
+  providerEncryptionKey?: string
   sessionSecret: string
   sessionHours: number
   sessionIdleMinutes: number
@@ -47,5 +48,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (!allowedOrigins.length || allowedOrigins.some(value => {
     try { const url = new URL(value); return url.origin !== value || !['http:', 'https:'].includes(url.protocol) || nodeEnv === 'production' && url.protocol !== 'https:' } catch { return true }
   })) throw new Error('APP_ORIGINS must contain exact HTTP(S) origins; production requires HTTPS')
-  return { nodeEnv: nodeEnv as ServerConfig['nodeEnv'], host, port: Number(rawPort), logLevel: logLevel as ServerConfig['logLevel'], databaseUrl, sessionSecret, sessionHours, sessionIdleMinutes, secureCookies, allowedOrigins: [...new Set(allowedOrigins)] }
+  const providerEncryptionKey = env.PROVIDER_ENCRYPTION_KEY
+  if (providerEncryptionKey !== undefined && (!/^[A-Za-z0-9_-]{43}$/.test(providerEncryptionKey) || Buffer.from(providerEncryptionKey, 'base64url').toString('base64url') !== providerEncryptionKey)) throw new Error('PROVIDER_ENCRYPTION_KEY must be 32 random bytes encoded as base64url')
+  return { ...(providerEncryptionKey ? { providerEncryptionKey } : {}), nodeEnv: nodeEnv as ServerConfig['nodeEnv'], host, port: Number(rawPort), logLevel: logLevel as ServerConfig['logLevel'], databaseUrl, sessionSecret, sessionHours, sessionIdleMinutes, secureCookies, allowedOrigins: [...new Set(allowedOrigins)] }
 }

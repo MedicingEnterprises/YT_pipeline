@@ -1,0 +1,1 @@
+ALTER TABLE "AIProvider" ADD COLUMN "lastConnectedAt" TIMESTAMPTZ(3);

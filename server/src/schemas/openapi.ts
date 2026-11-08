@@ -1,10 +1,11 @@
 import { resources, bodySchema, listSchema, preferencesSchema, jobActionSchema, reorderSchema, pipelineConfigurationSchema, type Resource } from './resources.js'
+import { textRequestSchema, usageQuerySchema } from './ai.schema.js'
 import { importSchema } from './import.schema.js'
 import { loginSchema, registerSchema, profileSchema, passwordSchema } from './auth.schema.js'
 type ObjectValue = Record<string, unknown>
 const error = { description: 'Error response', content: { 'application/json': { schema: { type: 'object', required: ['error'], properties: { error: { type: 'object', required: ['code', 'message', 'requestId'], properties: { code: { type: 'string' }, message: { type: 'string' }, requestId: { type: 'string' } } } } } } } }
 const response = (collection = false) => ({ description: 'Successful response. BigInt and Decimal values are JSON strings; timestamps are ISO UTC instants.', content: { 'application/json': { schema: { type: 'object', required: collection ? ['data', 'pagination'] : ['data'], properties: { data: collection ? { type: 'array', items: { type: 'object', additionalProperties: true } } : { type: 'object', additionalProperties: true }, ...(collection ? { pagination: { type: 'object', required: ['page', 'limit', 'total', 'totalPages'], properties: { page: { type: 'integer' }, limit: { type: 'integer' }, total: { type: 'integer' }, totalPages: { type: 'integer' } } } } : {}) } } } } })
-const errors = Object.fromEntries([400, 401, 403, 404, 409, 413, 415, 422, 429, 500, 503].map(status => [status, error]))
+const errors = Object.fromEntries([400, 401, 403, 404, 409, 413, 415, 422, 429, 500, 502, 503, 504].map(status => [status, error]))
 const requestBody = (schema: unknown) => ({ required: true, content: { 'application/json': { schema } } })
 const id = { in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }
 export function openApiDocument(): ObjectValue {
@@ -20,6 +21,10 @@ export function openApiDocument(): ObjectValue {
     paths[`${base}/{id}`]!.patch = operation(resource === 'jobs' ? 'Control a job' : `Update ${resource}`, 200, { requestBody: requestBody(resource === 'jobs' ? jobActionSchema : bodySchema(resource, true)) })
     paths[`${base}/{id}`]!.delete = operation(`Delete ${resource}`, 204)
   }
+  paths['/api/v1/ai/text'] = { post: operation('Generate text once using an owned configured provider/model. Unique requestId required; duplicate IDs return 409 without another provider call. Costs are unknown/null.', 200, { requestBody: requestBody(textRequestSchema) }) }
+  paths['/api/v1/ai/usage'] = { get: operation('List owned AI usage metadata; no prompts or generated text', 200, { parameters: Object.entries(usageQuerySchema.properties as ObjectValue).map(([name, schema]) => ({ in: 'query', name, schema })) }, true) }
+  paths['/api/v1/ai-provider-catalog'] = { get: operation('Read the maintained provider/model catalog; not a guarantee of account access', 200) }
+  paths['/api/v1/ai-providers/{id}/test-connection'] = { parameters: [id], post: operation('Verify stored credentials against the provider; no generation. Requires an enabled real adapter and saved key.', 200) }
   paths['/api/v1/preferences'] = { get: operation('Read preferences', 200), patch: operation('Update preferences', 200, { requestBody: requestBody({ ...preferencesSchema, minProperties: 1 }) }) }
   paths['/api/v1/jobs/{id}/history'] = { parameters: [id], get: operation('Read job history', 200, { parameters: [{ in: 'query', name: 'page', schema: { type: 'integer', minimum: 1, default: 1 } }, { in: 'query', name: 'limit', schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 } }] }, true) }
   paths['/api/v1/pipelines/{id}/steps/order'] = { parameters: [id], put: operation('Reorder all steps atomically', 200, { requestBody: requestBody(reorderSchema), responses: { ...errors, 200: { description: 'Ordered step records', content: { 'application/json': { schema: { type: 'object', required: ['data'], properties: { data: { type: 'array', items: { type: 'object' } } } } } } } } }) }

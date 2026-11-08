@@ -134,6 +134,7 @@ model User {
   passwordHash String?
   sessions     Session[]
   imports      WorkspaceImport[]
+  aiUsage      AIUsage[]
   channels     Channel[]
   providers    AIProvider[]
   pipelines    Pipeline[]
@@ -208,6 +209,9 @@ model AIProvider {
   connected        Boolean           @default(false)
   enabled          Boolean           @default(true)
   models           String[]          @default([])
+  lastConnectedAt  DateTime?         @db.Timestamptz(3)
+  adapterId        String            @default("mock") @db.VarChar(40)
+  credential       ProviderCredential?
   lastUsedAt       DateTime?         @db.Timestamptz(3)
   createdAt        DateTime          @default(now()) @db.Timestamptz(3)
   updatedAt        DateTime          @updatedAt @db.Timestamptz(3)
@@ -472,4 +476,45 @@ model UserPreferences {
   @@index([userId, textProviderId])
   @@index([userId, voiceProviderId])
   @@index([userId, imageProviderId])
+}
+
+// Separate from normal provider queries and workspace snapshots.
+model ProviderCredential {
+  providerId String @id @db.Uuid
+  userId String @db.Uuid
+  envelope String
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  provider AIProvider @relation(fields: [userId, providerId], references: [userId, id], onDelete: Cascade, onUpdate: NoAction)
+  @@unique([userId, providerId])
+  @@index([userId])
+}
+
+enum AIRequestStatus {
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  UNKNOWN
+}
+
+// Provider/model IDs are immutable audit snapshots, retained after provider deletion.
+// No prompts, generated content, headers, keys or provider payloads belong here.
+model AIUsage {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+  requestId String @db.Uuid
+  providerId String @db.Uuid
+  adapterId String @db.VarChar(40)
+  model String @db.VarChar(100)
+  status AIRequestStatus @default(PROCESSING)
+  requestedAt DateTime @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  inputTokens Int?
+  outputTokens Int?
+  cacheReadTokens Int?
+  cacheWriteTokens Int?
+  estimatedCostUsd Decimal? @db.Decimal(18, 8)
+  errorCode String? @db.VarChar(80)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([userId, requestId])
+  @@index([userId, requestedAt])
 }

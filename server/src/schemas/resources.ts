@@ -1,5 +1,7 @@
 import { ContentStatus, ContentFormat, Visibility, PublishPreference, ChannelStatus, ProviderCategory, StepKind, JobKind, JobType, JobStatus, ScheduleStatus, ActivityCategory, Appearance, WeeklyDigest } from '@prisma/client'
 
+import { adapterIds } from '../services/providers/adapters.js'
+
 type Schema = Record<string, unknown>
 export const uuid: Schema = { type: 'string', format: 'uuid' }
 const nullableId: Schema = { type: ['string', 'null'], format: 'uuid' }
@@ -21,6 +23,8 @@ export const resources = {
   } },
   'ai-providers': { delegate: 'aIProvider', required: ['name', 'category', 'models'], search: ['name'], filters: ['category', 'enabled'], sort: ['name', 'createdAt', 'updatedAt'], properties: {
     name: text(), category: enumeration(ProviderCategory), connected: bool, enabled: bool,
+    adapterId: { type: 'string', enum: [...adapterIds] },
+    apiKey: { type: ['string', 'null'], minLength: 1, maxLength: 8192, pattern: '\\S', writeOnly: true },
     models: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: text(100) },
   } },
   content: { delegate: 'contentItem', required: ['title', 'channelId', 'pipelineId'], search: ['title', 'notes'], filters: ['status', 'channelId', 'pipelineId', 'format'], sort: ['title', 'createdAt', 'updatedAt', 'publishedAt'], properties: {

@@ -1,3 +1,4 @@
+import type { ProbeOptions } from './services/providers/http.js'
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
@@ -17,11 +18,11 @@ declare module 'fastify' {
   }
 }
 
-export function buildApp(config: ServerConfig, options: { database?: ReturnType<typeof createDatabaseClient>; now?: () => Date } = {}) {
+export function buildApp(config: ServerConfig, options: { database?: ReturnType<typeof createDatabaseClient>; now?: () => Date; providerProbe?: ProbeOptions } = {}) {
   const app = Fastify({
     logger: {
       level: config.logLevel,
-      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]', 'req.body', 'password', 'passwordHash', 'currentPassword', 'newPassword', 'sessionSecret', 'token', 'tokenHash', 'csrfToken', 'databaseUrl', '*.password', '*.passwordHash', '*.currentPassword', '*.newPassword', '*.sessionSecret', '*.token', '*.tokenHash', '*.csrfToken', '*.databaseUrl'],
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]', 'req.body', 'prompt', 'systemPrompt', 'text', '*.prompt', '*.systemPrompt', '*.text', 'apiKey', '*.apiKey', 'providerEncryptionKey', '*.providerEncryptionKey', 'envelope', '*.envelope', 'password', 'passwordHash', 'currentPassword', 'newPassword', 'sessionSecret', 'token', 'tokenHash', 'csrfToken', 'databaseUrl', '*.password', '*.passwordHash', '*.currentPassword', '*.newPassword', '*.sessionSecret', '*.token', '*.tokenHash', '*.csrfToken', '*.databaseUrl'],
       // Deliberately omit query strings, headers, bodies and raw error messages.
       // Prisma/driver errors can contain query values or connection credentials.
       serializers: {
@@ -57,6 +58,6 @@ export function buildApp(config: ServerConfig, options: { database?: ReturnType<
   app.register(routes)
   const auth = new AuthService(database, config, options.now)
   app.register(authRoutes, { prefix: '/api/v1/auth', auth })
-  app.register(workspaceRoutes, { prefix: '/api/v1', auth })
+  app.register(workspaceRoutes, { prefix: '/api/v1', auth, sensitiveValues: [config.sessionSecret], ...(options.now ? { now: options.now } : {}), ...(options.providerProbe ? { providerProbe: options.providerProbe } : {}), ...(config.providerEncryptionKey ? { encryptionKey: config.providerEncryptionKey } : {}) })
   return app
 }

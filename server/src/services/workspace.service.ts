@@ -1,4 +1,7 @@
 import type { PrismaClient } from '@prisma/client'
+import { validateModelSelection } from './providers/catalog.js'
+import { providerAdapters, type AdapterId } from './providers/adapters.js'
+import { ProviderCredentialService } from './providers/credentials.js'
 import { randomUUID } from 'node:crypto'
 import { WorkspaceRepository, writeTransaction, type Data, type Row } from '../database/workspace.repository.js'
 import { resources, type Resource } from '../schemas/resources.js'
@@ -19,7 +22,7 @@ function input(data: Data): Data {
   return timestamps(cleaned)
 }
 export class WorkspaceService {
-  constructor(private readonly database: PrismaClient) {}
+  constructor(private readonly database: PrismaClient, private readonly encryptionKey?: string) {}
   async list(resource: Resource, userId: string, query: ListQuery): Promise<Data> {
     return this.database.$transaction(async tx => {
       const repo = new WorkspaceRepository(tx)
@@ -46,10 +49,23 @@ export class WorkspaceService {
     return writeTransaction(this.database, userId, async repo => {
       const previous = id ? await repo.require(resource, userId, id) : undefined
       const data = input(raw)
+      const apiKey = resource === 'ai-providers' ? data.apiKey : undefined
+      delete data.apiKey
       const value: Data = { ...(resource === 'content' ? { status: 'IDEA' } : {}), ...(resource === 'pipelines' ? { enabled: true } : {}), ...previous, ...data }
       if (resource === 'schedules') return this.saveSchedule(repo, userId, data, previous)
       if (resource === 'jobs') return this.createJob(repo, userId, data)
       if (resource === 'pipeline-steps') return this.saveStep(repo, userId, data, previous)
+      if (resource === 'ai-providers') {
+        providerAdapters.get((value.adapterId ?? 'mock') as AdapterId).validateConfiguration(value.models as string[])
+        // Preserve historical records on unrelated edits; new selections must be valid.
+        if (!previous || ['adapterId', 'category', 'models'].some(field => JSON.stringify(value[field]) !== JSON.stringify(previous[field]))) {
+          validateModelSelection(String(value.adapterId ?? 'mock'), String(value.category), value.models as string[])
+        }
+        if ((value.adapterId ?? 'mock') !== 'mock' && data.connected === true) invalid('Use the provider connection test to verify real credentials')
+        if (apiKey !== undefined || previous && data.adapterId !== undefined && data.adapterId !== previous.adapterId) {
+          data.connected = false; data.lastConnectedAt = null
+        }
+      }
       await validateResource(repo, userId, resource, value, previous)
       if (resource === 'analytics' && typeof data.views === 'string') data.views = BigInt(data.views)
       const assigned = data.assignedChannelIds as string[] | undefined
@@ -66,6 +82,7 @@ export class WorkspaceService {
       const row = previous
         ? await repo.table(resource).update({ where: { id: previous.id, userId }, data })
         : await repo.table(resource).create({ data: { ...data, userId } })
+      if (resource === 'ai-providers' && apiKey !== undefined) await new ProviderCredentialService(this.encryptionKey).save(repo.db, userId, row.id, apiKey as string | null)
       if (resource === 'pipelines') {
         if (steps) for (const step of steps) await repo.table('pipeline-steps').create({ data: { ...step, pipelineId: row.id, userId } })
         if (assigned) {
@@ -269,6 +286,10 @@ export class WorkspaceService {
         if (data[field!]) {
           const provider = await repo.require('ai-providers', userId, String(data[field!]))
           if (!provider.enabled || provider.category !== category) invalid('Choose an enabled provider of the appropriate category')
+          if ((provider.adapterId ?? 'mock') !== 'mock') {
+            if (!provider.connected) invalid('Test and connect the provider before making it a default')
+            validateModelSelection(String(provider.adapterId), String(provider.category), provider.models as string[])
+          }
         }
       }
       const old = await repo.table('preferences').findFirst({ where: { userId } })
